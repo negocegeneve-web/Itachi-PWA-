@@ -68,7 +68,7 @@ const STRAT = {
   // Garde-fous
   MAX_TRANCHES: 5, // pyramiding : nombre max de tranches sur la position BTC
   MIN_GAP_MS: 90000, // 90s (1min30) minimum entre 2 tranches
-  Q_MIN: 50, // quality minimum pour ouvrir/ajouter
+  Q_MIN: 39, // quality minimum pour ouvrir/ajouter
   FEE_PER_SIDE: 0.0004, // 0.04% taker par leg (info P&L)
   // Calibrage du signal (ajustable selon les conditions de marché)
   MOM_WINDOW: 20, // nb de ticks pour mesurer le momentum (~20s)
@@ -132,27 +132,55 @@ function sign(query) {
 
 async function signedRequest(method, path, params = {}) {
   const timestamp = Date.now();
-  const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
+  const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
   const signature = sign(query);
   const url = `${REST_BASE}${path}?${query}&signature=${signature}`;
 
-  const res = await fetch(url, {
-    method,
-    headers: { 'X-MBX-APIKEY': API_KEY },
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(`Binance ${res.status}: ${JSON.stringify(data)}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000); // timeout réseau 8s
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'X-MBX-APIKEY': API_KEY },
+      signal: controller.signal,
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const err = new Error(`Binance ${res.status}: ${JSON.stringify(data)}`);
+      err.binanceCode = data && data.code; // -1007, -2019, etc.
+      err.httpStatus = res.status;
+      throw err;
+    }
+    return data;
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      const err = new Error('Binance: timeout réseau (8s)');
+      err.binanceCode = -1007; // on traite comme un timeout backend
+      throw err;
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
   }
-  return data;
 }
 
-async function publicRequest(path, params = {}) {
+async function publicRequest(path, params = {}, retries = 2) {
   const query = new URLSearchParams(params).toString();
   const url = `${REST_BASE}${path}${query ? '?' + query : ''}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance public ${res.status}`);
-  return res.json();
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`Binance public ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      clearTimeout(timer);
+      if (attempt === retries) throw e; // dernier essai → on remonte l'erreur
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1))); // backoff
+    }
+  }
 }
 
 // ------------------------------------------------------------------
@@ -515,12 +543,36 @@ async function openOrAddTranche(signal) {
   const useLev = state.position ? state.position.lev : lev;
   if (!state.position) await setLeverage(useLev);
 
+  // Mémorise la taille de position AVANT l'ordre (pour détecter si l'ordre est passé malgré un timeout)
+  const before = await fetchBinancePosition();
+  const beforeQty = before ? before.qty : 0;
+
+  let orderOk = false;
   try {
     await marketOrder(signal.side, qty);
+    orderOk = true;
   } catch (e) {
-    logLine(`❌ Entrée échouée: ${e.message}`);
-    return;
+    if (e.binanceCode === -1007) {
+      // Timeout backend : statut d'exécution INCONNU. On NE suppose RIEN.
+      // On demande à Binance ce qui s'est réellement passé.
+      logLine(`⏳ Timeout -1007 sur l'ordre — vérification de la position réelle Binance...`);
+      await new Promise((r) => setTimeout(r, 1500)); // laisse Binance se stabiliser
+      const after = await fetchBinancePosition();
+      const afterQty = after ? after.qty : 0;
+      if (afterQty > beforeQty + SYMBOL_INFO.stepSize) {
+        // La position a augmenté → l'ordre EST passé malgré le timeout
+        orderOk = true;
+        logLine(`✅ L'ordre était bien passé côté Binance (position ${beforeQty}→${afterQty}).`);
+      } else {
+        logLine(`↩️ L'ordre n'est pas passé (position inchangée). On réessaiera au prochain signal.`);
+        return;
+      }
+    } else {
+      logLine(`❌ Entrée échouée: ${e.message}`);
+      return;
+    }
   }
+  if (!orderOk) return;
 
   const entry = state.price;
   const tranche = {
@@ -574,8 +626,21 @@ async function closePosition(reason) {
   try {
     await marketOrder(closeSide, pos.qty, true);
   } catch (e) {
-    logLine(`❌ Fermeture échouée: ${e.message}`);
-    return;
+    if (e.binanceCode === -1007) {
+      // Timeout : l'ordre de fermeture est peut-être passé. On vérifie côté Binance.
+      logLine(`⏳ Timeout -1007 sur la fermeture — vérification côté Binance...`);
+      await new Promise((r) => setTimeout(r, 1500));
+      const after = await fetchBinancePosition();
+      if (after) {
+        // Position toujours ouverte → la fermeture a échoué, on réessaiera au prochain tick
+        logLine(`↩️ Position encore ouverte côté Binance. Nouvel essai au prochain tick.`);
+        return;
+      }
+      logLine(`✅ Position bien fermée côté Binance malgré le timeout.`);
+    } else {
+      logLine(`❌ Fermeture échouée: ${e.message}`);
+      return;
+    }
   }
 
   const exit = state.price;
@@ -688,16 +753,25 @@ function managePosition() {
 // ------------------------------------------------------------------
 // BOUCLE PRINCIPALE
 // ------------------------------------------------------------------
+let tradeBusy = false; // verrou : un seul ordre en cours à la fois
 async function tradingTick() {
   if (!state.running || state.price <= 0) return;
 
-  // 1. Gérer la position en cours (SL/TP/trailing global)
+  // 1. Gérer la position en cours (SL/TP/trailing global) — toujours actif
   managePosition();
 
-  // 2. Chercher une entrée (nouvelle position OU tranche supplémentaire de pyramiding)
+  // 2. Si un ordre est déjà en cours de traitement, on ne lance rien d'autre
+  if (tradeBusy) return;
+
+  // 3. Chercher une entrée (nouvelle position OU tranche supplémentaire de pyramiding)
   const signal = computeSignal();
   if (signal) {
-    await openOrAddTranche(signal);
+    tradeBusy = true;
+    try {
+      await openOrAddTranche(signal);
+    } finally {
+      tradeBusy = false;
+    }
   }
 }
 
@@ -1048,7 +1122,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <span class="qb"><span class="trk">RSI</span><b id="qb-rsi">0</b></span>
     <span class="qb hl"><span class="trk">MTF</span><b id="qb-mtf">0</b></span>
     <span class="qb"><span class="trk">S/R</span><b id="qb-sr">0</b></span>
-    <span class="qb total"><span class="trk">Q total</span><b id="qb-tot">0</b><span class="trk">/ 50 requis</span></span>
+    <span class="qb total"><span class="trk">Q total</span><b id="qb-tot">0</b><span class="trk">/ 39 requis</span></span>
   </div>
 
   <!-- Graphique BTC live (calé sur Binance testnet) -->
@@ -1184,7 +1258,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       $('i-mom').className = 'v '+cls(m);
     }
     $('i-q').textContent = ind.quality!=null ? 'Q'+ind.quality : '—';
-    $('i-q').className = 'v '+(ind.quality!=null && ind.quality>=50 ? 'cyan':'mut');
+    $('i-q').className = 'v '+(ind.quality!=null && ind.quality>=39 ? 'cyan':'mut');
     const b = ind.bias||'NEUTRE';
     $('i-bias').textContent = b;
     $('i-bias').className = 'v '+(b==='LONG'?'green':b==='SHORT'?'red':'mut');
@@ -1211,7 +1285,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       $('qb-rsi').textContent = bd.rsi; $('qb-mtf').textContent = bd.mtf; $('qb-sr').textContent = bd.sr;
       const tot = ind.quality!=null?ind.quality:0;
       $('qb-tot').textContent = tot;
-      $('qb-tot').style.color = tot>=50 ? 'var(--green)' : 'var(--cyan)';
+      $('qb-tot').style.color = tot>=39 ? 'var(--green)' : 'var(--cyan)';
     } else {
       ['qb-ema','qb-mom','qb-rsi','qb-mtf','qb-sr','qb-tot'].forEach(id=>$(id).textContent='0');
     }
