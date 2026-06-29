@@ -835,10 +835,30 @@ function broadcast(obj) {
   }
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   if (req.url === '/' || req.url === '/dashboard') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(DASHBOARD_HTML);
+    return;
+  }
+  if (req.url === '/backtest') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(BACKTEST_HTML);
+    return;
+  }
+  if (req.url.startsWith('/api/backtest')) {
+    try {
+      const u = new URL(req.url, 'http://x');
+      const tf = u.searchParams.get('tf') || '1m';
+      const limit = Math.min(1500, parseInt(u.searchParams.get('limit') || '1000', 10));
+      const capital = parseFloat(u.searchParams.get('capital') || '1000');
+      const result = await runBacktest(tf, limit, capital);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
   if (req.url === '/health') {
@@ -953,6 +973,375 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => clients.delete(ws));
 });
+
+// ------------------------------------------------------------------
+// MOTEUR DE BACKTEST (vraies bougies Binance mainnet, lecture seule)
+// ------------------------------------------------------------------
+const BT_REST = 'https://fapi.binance.com'; // mainnet public, lecture seule
+
+async function btKlines(interval, limit) {
+  const url = `${BT_REST}/fapi/v1/klines?symbol=${ASSET}&interval=${interval}&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Binance klines ${interval}: ${res.status}`);
+  const raw = await res.json();
+  return raw.map((c) => ({
+    time: c[0],
+    high: parseFloat(c[2]),
+    low: parseFloat(c[3]),
+    close: parseFloat(c[4]),
+  }));
+}
+
+// Scoring identique au live mais en paramètres explicites (pas de state global)
+function btScore({ isLong, momentum, emaSpread, rsiVal, alignNorm, posInRange }) {
+  const emaScore = Math.min(20, emaSpread * STRAT.EMA_MULT);
+  const momScore = Math.min(20, Math.abs(momentum) * STRAT.MOM_MULT);
+  let rsiScore = 0;
+  if (rsiVal != null) {
+    if (isLong) rsiScore = rsiVal < 30 ? 15 : rsiVal < 45 ? 10 : rsiVal < 60 ? 5 : 0;
+    else rsiScore = rsiVal > 70 ? 15 : rsiVal > 55 ? 10 : rsiVal > 40 ? 5 : 0;
+  }
+  const aligned = isLong ? alignNorm : -alignNorm;
+  const mtfScore = Math.max(0, Math.min(30, aligned * 30));
+  let srScore = 0;
+  if (posInRange != null) {
+    if (isLong) srScore = posInRange < 0.4 ? 15 : posInRange < 0.6 ? 8 : 2;
+    else srScore = posInRange > 0.6 ? 15 : posInRange > 0.4 ? 8 : 2;
+  }
+  return Math.round(emaScore + momScore + rsiScore + mtfScore + srScore);
+}
+
+function btTrendAt(closes, idx) {
+  const slice = closes.slice(0, idx + 1);
+  const ef = emaFromCloses(slice, 9), es = emaFromCloses(slice, 21);
+  if (ef == null || es == null) return 0;
+  return ef > es ? 1 : ef < es ? -1 : 0;
+}
+
+async function runBacktest(tf, limit, capitalStart) {
+  const main = await btKlines(tf, limit);
+  const closes = main.map((c) => c.close);
+
+  // Timeframes supérieurs pour l'alignement
+  const mtfCloses = {};
+  for (const t of TIMEFRAMES) {
+    try {
+      const k = await btKlines(t, Math.min(500, limit));
+      mtfCloses[t] = k.map((c) => c.close);
+    } catch (e) {
+      /* tf indisponible, on continue */
+    }
+  }
+
+  let capital = capitalStart;
+  let peak = capitalStart, maxDD = 0;
+  let pos = null;
+  let killed = false;
+  const trades = [];
+  const equity = [{ i: 0, capital }];
+  const SR_WIN = 20;
+
+  for (let i = STRAT.EMA_SLOW + 2; i < main.length; i++) {
+    if (killed) break;
+    const px = closes[i];
+
+    // Gestion position ouverte
+    if (pos) {
+      const dir = pos.side === 'BUY' ? 1 : -1;
+      const pnlPct = ((px - pos.avgEntry) / pos.avgEntry) * dir;
+      if (pos.side === 'BUY' && px > pos.peakPx) pos.peakPx = px;
+      if (pos.side === 'SELL' && px < pos.peakPx) pos.peakPx = px;
+      if (!pos.trailing && pnlPct >= STRAT.TP_PCT) pos.trailing = true;
+      let close = null;
+      if (pos.trailing) {
+        const draw = pos.side === 'BUY' ? (pos.peakPx - px) / pos.peakPx : (px - pos.peakPx) / pos.peakPx;
+        if (draw >= STRAT.TRAIL_PCT) close = 'TRAILING';
+      } else if (pnlPct <= -STRAT.SL_PCT) {
+        close = 'STOP-LOSS';
+      }
+      if (close) {
+        const gross = pnlPct * pos.stake * pos.lev;
+        const fees = pos.stake * pos.lev * STRAT.FEE_PER_SIDE * 2;
+        const net = gross - fees;
+        capital += net;
+        trades.push({
+          side: pos.side, tranches: pos.tranches.length, entry: pos.avgEntry, exit: px,
+          investi: pos.stake, lev: pos.lev, pnlPct: pnlPct * 100, net, fees, reason: close,
+          bars: i - pos.openIdx,
+        });
+        equity.push({ i, capital });
+        if (capital > peak) peak = capital;
+        const dd = (peak - capital) / peak;
+        if (dd > maxDD) maxDD = dd;
+        pos = null;
+        if (capital <= capitalStart * (1 - STRAT.KILL_PCT)) killed = true;
+        continue;
+      }
+    }
+
+    // Signal
+    const slice = closes.slice(0, i + 1);
+    const ef = emaFromCloses(slice, STRAT.EMA_FAST), es = emaFromCloses(slice, STRAT.EMA_SLOW);
+    if (ef == null || es == null) continue;
+    const prev = closes[i - STRAT.MOM_WINDOW] !== undefined ? closes[i - STRAT.MOM_WINDOW] : closes[0];
+    const momentum = (px - prev) / prev;
+    const bull = ef > es && momentum > 0;
+    const bear = ef < es && momentum < 0;
+    if (!bull && !bear) continue;
+    const isLong = bull;
+
+    // Alignement MTF
+    let weighted = 0, totalW = 0;
+    for (const t of TIMEFRAMES) {
+      const arr = mtfCloses[t];
+      if (!arr || !arr.length) continue;
+      const tfIdx = Math.min(arr.length - 1, Math.floor((i / main.length) * arr.length));
+      weighted += btTrendAt(arr, tfIdx) * TF_WEIGHTS[t];
+      totalW += TF_WEIGHTS[t];
+    }
+    const alignNorm = totalW ? weighted / totalW : 0;
+
+    const rsiVal = rsi(slice, 14);
+    const winHigh = Math.max(...main.slice(Math.max(0, i - SR_WIN), i + 1).map((c) => c.high));
+    const winLow = Math.min(...main.slice(Math.max(0, i - SR_WIN), i + 1).map((c) => c.low));
+    const range = winHigh - winLow;
+    const posInRange = range > 0 ? (px - winLow) / range : 0.5;
+    const emaSpread = Math.abs(ef - es) / es;
+
+    const q = btScore({ isLong, momentum, emaSpread, rsiVal, alignNorm, posInRange });
+    if (q < STRAT.Q_MIN) continue;
+
+    if (pos && pos.side !== (isLong ? 'BUY' : 'SELL')) continue;
+    if (pos && pos.tranches.length >= STRAT.MAX_TRANCHES) continue;
+    if (pos && i - pos.lastIdx < STRAT.MIN_GAP_BARS) continue;
+
+    let pct, lev;
+    if (q >= 80) { pct = STRAT.STAKE_HIGH; lev = STRAT.LEV_HIGH; }
+    else if (q >= 55) { pct = STRAT.STAKE_MED; lev = STRAT.LEV_MED; }
+    else { pct = STRAT.STAKE_LOW; lev = STRAT.LEV_LOW; }
+    const stake = capital * pct;
+
+    if (!pos) {
+      pos = {
+        side: isLong ? 'BUY' : 'SELL', lev, tranches: [{ entry: px, stake }],
+        avgEntry: px, stake, peakPx: px, trailing: false, openIdx: i, lastIdx: i,
+      };
+    } else {
+      pos.tranches.push({ entry: px, stake });
+      pos.lastIdx = i;
+    }
+    let ws = 0, ts = 0;
+    for (const t of pos.tranches) { ws += t.entry * t.stake; ts += t.stake; }
+    pos.avgEntry = ws / ts;
+    pos.stake = ts;
+  }
+
+  // Stats
+  const n = trades.length;
+  const wins = trades.filter((t) => t.net >= 0).length;
+  const grossWin = trades.filter((t) => t.net >= 0).reduce((a, t) => a + t.net, 0);
+  const grossLoss = Math.abs(trades.filter((t) => t.net < 0).reduce((a, t) => a + t.net, 0));
+  const totalFees = trades.reduce((a, t) => a + t.fees, 0);
+
+  return {
+    asset: ASSET,
+    tf,
+    bars: main.length,
+    capitalStart,
+    capitalEnd: capital,
+    netTotal: capital - capitalStart,
+    netPct: ((capital - capitalStart) / capitalStart) * 100,
+    fees: totalFees,
+    trades: n,
+    wins,
+    losses: n - wins,
+    winRate: n ? (wins / n) * 100 : 0,
+    profitFactor: grossLoss ? grossWin / grossLoss : grossWin > 0 ? 999 : 0,
+    maxDrawdown: maxDD * 100,
+    killed,
+    equity: equity.map((e) => e.capital),
+    lastTrades: trades.slice(-15).map((t) => ({
+      side: t.side, tranches: t.tranches, entry: t.entry, exit: t.exit,
+      net: t.net, pnlPct: t.pnlPct, reason: t.reason, bars: t.bars,
+    })),
+  };
+}
+
+// ------------------------------------------------------------------
+// PAGE BACKTEST
+// ------------------------------------------------------------------
+const BACKTEST_HTML = `<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#00F5C8">
+<title>Itachi — Backtest</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root{--bg:#070b10;--card:#101820;--card2:#0e151d;--cyan:#00F5C8;--cyan-dim:rgba(0,245,200,.12);
+    --green:#22e58a;--red:#ff5470;--txt:#e7f0ef;--mut:#7c8b95;--line:#1a2530}
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:radial-gradient(1200px 600px at 50% -200px,rgba(0,245,200,.06),transparent),var(--bg);
+    color:var(--txt);font-family:'Segoe UI',system-ui,sans-serif;padding:16px;max-width:1000px;margin:0 auto}
+  .head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+  .logo{font-size:19px;font-weight:800}.logo .c{color:var(--cyan)}
+  .sub{color:var(--mut);font-size:12px;margin-bottom:16px}
+  a.back{color:var(--cyan);text-decoration:none;font-size:13px;margin-left:auto}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:end}
+  .field{display:flex;flex-direction:column;gap:5px}
+  .field label{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
+  select,input{background:var(--card2);border:1px solid var(--line);color:var(--txt);
+    border-radius:8px;padding:9px 12px;font-size:14px;font-family:inherit;min-width:110px}
+  button{background:var(--cyan);color:#04221d;border:0;border-radius:9px;padding:11px 22px;
+    font-size:14px;font-weight:700;cursor:pointer;font-family:inherit}
+  button:disabled{opacity:.5;cursor:wait}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px 15px}
+  .card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .card .v{font-size:21px;font-weight:800;margin-top:5px;font-variant-numeric:tabular-nums}
+  .green{color:var(--green)}.red{color:var(--red)}.cyan{color:var(--cyan)}.mut{color:var(--mut)}
+  .chart-box{position:relative;height:240px;background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:right;padding:8px 11px;border-bottom:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--mut);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;background:var(--card)}
+  .table-wrap{border:1px solid var(--line);border-radius:12px;overflow:hidden;background:var(--card2)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:700}
+  .pill.long{background:rgba(34,229,138,.15);color:var(--green)}
+  .pill.short{background:rgba(255,84,112,.15);color:var(--red)}
+  .verdict{padding:14px;border-radius:12px;margin-bottom:14px;font-size:14px;font-weight:600}
+  .v-good{background:rgba(34,229,138,.1);border:1px solid rgba(34,229,138,.3);color:var(--green)}
+  .v-mid{background:rgba(255,181,71,.1);border:1px solid rgba(255,181,71,.3);color:#ffb547}
+  .v-bad{background:rgba(255,84,112,.1);border:1px solid rgba(255,84,112,.3);color:var(--red)}
+  .status{color:var(--mut);font-size:13px;margin:10px 0}
+  .disclaimer{color:var(--mut);font-size:11px;font-style:italic;margin-top:10px}
+</style></head>
+<body>
+  <div class="head">
+    <span class="logo">CryptoSignal<span class="c">AI</span> · Backtest</span>
+    <a class="back" href="/">← Retour au bot</a>
+  </div>
+  <div class="sub">Stratégie rejouée sur les vraies bougies Binance (mainnet, lecture seule)</div>
+
+  <div class="panel">
+    <div class="row">
+      <div class="field"><label>Timeframe</label>
+        <select id="tf">
+          <option value="1m">1 minute</option>
+          <option value="3m">3 minutes</option>
+          <option value="5m" selected>5 minutes</option>
+          <option value="15m">15 minutes</option>
+          <option value="1h">1 heure</option>
+        </select>
+      </div>
+      <div class="field"><label>Nb de bougies</label>
+        <select id="limit">
+          <option value="500">500</option>
+          <option value="1000" selected>1000</option>
+          <option value="1500">1500 (max)</option>
+        </select>
+      </div>
+      <div class="field"><label>Capital ($)</label>
+        <input id="capital" type="number" value="1000" min="100" step="100">
+      </div>
+      <button id="run">▶ Lancer le backtest</button>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="disclaimer">Un backtest est optimiste (pas de slippage ni timeout réel). Sert à éliminer les mauvaises stratégies, pas à prédire des gains exacts.</div>
+  </div>
+
+  <div id="results" style="display:none">
+    <div class="verdict" id="verdict"></div>
+    <div class="grid">
+      <div class="card"><div class="k">Capital final</div><div class="v" id="r-cap">—</div></div>
+      <div class="card"><div class="k">P&L net</div><div class="v" id="r-net">—</div></div>
+      <div class="card"><div class="k">Win Rate</div><div class="v" id="r-wr">—</div></div>
+      <div class="card"><div class="k">Trades</div><div class="v" id="r-n">—</div></div>
+      <div class="card"><div class="k">Profit Factor</div><div class="v" id="r-pf">—</div></div>
+      <div class="card"><div class="k">Drawdown Max</div><div class="v" id="r-dd">—</div></div>
+      <div class="card"><div class="k">Gagnés / Perdus</div><div class="v" id="r-wl">—</div></div>
+      <div class="card"><div class="k">Frais cumulés</div><div class="v mut" id="r-fees">—</div></div>
+    </div>
+    <div class="chart-box"><canvas id="equity"></canvas></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Sens</th><th>Tranches</th><th>Entrée</th><th>Sortie</th><th>P&L %</th><th>Net $</th><th>Raison</th><th>Durée</th></tr></thead>
+        <tbody id="trades"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  const $ = id => document.getElementById(id);
+  const num = (n,d=2) => Number(n).toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d});
+  const sign = n => n>=0?'+':'';
+  const cls = n => n>=0?'green':'red';
+  let eqChart = null;
+
+  async function runBacktest(){
+    $('run').disabled = true;
+    $('status').textContent = '⏳ Récupération des bougies Binance et simulation en cours...';
+    $('results').style.display = 'none';
+    try{
+      const tf = $('tf').value, limit = $('limit').value, capital = $('capital').value;
+      const res = await fetch('/api/backtest?tf='+tf+'&limit='+limit+'&capital='+capital);
+      const d = await res.json();
+      if(d.error){ $('status').textContent = '❌ Erreur : '+d.error; $('run').disabled=false; return; }
+      render(d);
+      $('status').textContent = '✅ Backtest terminé sur '+d.bars+' bougies '+d.tf+'.';
+    }catch(e){
+      $('status').textContent = '❌ Erreur : '+e.message;
+    }
+    $('run').disabled = false;
+  }
+
+  function render(d){
+    $('results').style.display = 'block';
+    $('r-cap').textContent = '$'+num(d.capitalEnd);
+    $('r-net').textContent = sign(d.netTotal)+'$'+num(d.netTotal)+' ('+sign(d.netPct)+d.netPct.toFixed(1)+'%)';
+    $('r-net').className = 'v '+cls(d.netTotal);
+    $('r-wr').textContent = d.winRate.toFixed(1)+'%';
+    $('r-wr').className = 'v '+(d.winRate>=50?'green':'red');
+    $('r-n').textContent = d.trades;
+    $('r-pf').textContent = d.profitFactor>=999?'∞':d.profitFactor.toFixed(2);
+    $('r-pf').className = 'v '+(d.profitFactor>=1.3?'green':d.profitFactor>=1?'cyan':'red');
+    $('r-dd').textContent = d.maxDrawdown.toFixed(1)+'%';
+    $('r-dd').className = 'v '+(d.maxDrawdown<15?'green':d.maxDrawdown<30?'cyan':'red');
+    $('r-wl').textContent = d.wins+' / '+d.losses;
+    $('r-fees').textContent = '$'+num(d.fees);
+
+    // Verdict
+    const v = $('verdict');
+    if(d.killed){ v.className='verdict v-bad'; v.textContent='🛑 Kill switch déclenché (-20% du capital). Stratégie trop risquée sur cette période.'; }
+    else if(d.trades < 20){ v.className='verdict v-mid'; v.textContent='⚠️ Trop peu de trades ('+d.trades+') pour conclure. Augmente le nombre de bougies ou change de timeframe.'; }
+    else if(d.winRate>=55 && d.profitFactor>=1.3){ v.className='verdict v-good'; v.textContent='✅ Statistiquement encourageant sur cet historique. À confirmer sur d autres périodes avant tout argent réel.'; }
+    else if(d.winRate>=45){ v.className='verdict v-mid'; v.textContent='🟡 Résultat mitigé : pas d avantage net ici. Le calibrage mérite d être revu.'; }
+    else { v.className='verdict v-bad'; v.textContent='🔴 Non rentable sur cet historique. À ne pas passer en réel en l état.'; }
+
+    // Courbe de capital
+    if(eqChart) eqChart.destroy();
+    const ctx = $('equity').getContext('2d');
+    const grad = ctx.createLinearGradient(0,0,0,240);
+    grad.addColorStop(0,'rgba(0,245,200,.25)'); grad.addColorStop(1,'rgba(0,245,200,0)');
+    eqChart = new Chart(ctx,{type:'line',
+      data:{labels:d.equity.map((_,i)=>i),datasets:[{data:d.equity,borderColor:'#00F5C8',borderWidth:2,backgroundColor:grad,fill:true,tension:.2,pointRadius:0}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},title:{display:true,text:'Évolution du capital',color:'#7c8b95',font:{size:12}}},
+        scales:{x:{display:false},y:{position:'right',grid:{color:'rgba(26,37,48,.6)'},ticks:{color:'#7c8b95',font:{size:10},callback:v=>'$'+Number(v).toLocaleString('fr-FR',{maximumFractionDigits:0})}}}}});
+
+    // Trades
+    $('trades').innerHTML = (d.lastTrades||[]).slice().reverse().map(t=>{
+      const sc = t.side==='BUY'?'long':'short'; const st = t.side==='BUY'?'LONG':'SHORT';
+      return '<tr><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.tranches+'</td>'+
+        '<td>'+num(t.entry)+'</td><td>'+num(t.exit)+'</td>'+
+        '<td class="'+cls(t.net)+'">'+sign(t.pnlPct)+t.pnlPct.toFixed(2)+'%</td>'+
+        '<td class="'+cls(t.net)+'">'+sign(t.net)+'$'+num(t.net)+'</td>'+
+        '<td class="mut">'+t.reason+'</td><td class="mut">'+t.bars+' barres</td></tr>';
+    }).join('');
+  }
+
+  $('run').onclick = runBacktest;
+</script>
+</body></html>`;
 
 // ------------------------------------------------------------------
 // DASHBOARD HTML (affichage uniquement, aucune logique de trading)
@@ -1084,6 +1473,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <button id="start" class="btn-go">▶ Démarrer</button>
     <button id="stop" class="btn-stop">⏸ Pause</button>
     <button id="closeAll" class="btn-kill">⏹ Tout fermer</button>
+    <a href="/backtest" style="margin-left:auto;align-self:center;color:var(--cyan);text-decoration:none;font-size:13px;font-weight:600">📊 Backtest →</a>
   </div>
 
   <!-- Bandeau indicateurs live -->
