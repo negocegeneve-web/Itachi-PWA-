@@ -602,6 +602,7 @@ function snapshot() {
     capital: state.capital,
     capitalStart: state.capitalStart,
     price: state.price,
+    priceHistory: state.prices.slice(-120), // amorce le graphique
     indicators: state.indicators,
     position: livePosition(),
     stats: state.stats,
@@ -649,6 +650,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#00F5C8">
 <title>Itachi — CryptoSignal AI</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
   :root{
     --bg:#070b10;--bg2:#0c1219;--card:#101820;--card2:#0e151d;
@@ -713,6 +715,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   .log{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px;
     font-family:'SF Mono',Consolas,monospace;font-size:11px;max-height:220px;overflow:auto;color:#8aa0a0;line-height:1.7}
+
+  /* Graphique BTC live */
+  .chart-card{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px;position:relative}
+  .chart-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+  .chart-head .pair{font-size:13px;font-weight:700}
+  .chart-head .live{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--mut)}
+  .chart-head .live .dot{width:7px;height:7px;border-radius:50%;background:var(--cyan);box-shadow:0 0 8px var(--cyan);animation:pulse 1.5s infinite}
+  .chart-head .px{font-size:15px;font-weight:800;color:var(--cyan);font-variant-numeric:tabular-nums}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .chart-box{position:relative;height:240px}
 </style></head>
 <body>
   <div class="head">
@@ -737,6 +749,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="ind"><div class="k">Force signal</div><div class="v" id="i-q">—</div></div>
     <div class="ind"><div class="k">Biais</div><div class="v mut" id="i-bias">NEUTRE</div></div>
     <div class="ind"><div class="k">Levier prochain</div><div class="v" id="i-lev">—</div></div>
+  </div>
+
+  <!-- Graphique BTC live (calé sur Binance testnet) -->
+  <div class="chart-card">
+    <div class="chart-head">
+      <span class="pair" id="chart-pair">BTC/USDT — Binance</span>
+      <span class="live"><span class="dot"></span>LIVE <span class="px" id="chart-px">—</span></span>
+    </div>
+    <div class="chart-box"><canvas id="chart"></canvas></div>
   </div>
 
   <!-- Cartes stats -->
@@ -783,6 +804,65 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if(!ms) return '—';
     const s=Math.floor(ms/1000); if(s<60) return s+'s';
     const m=Math.floor(s/60); const r=s%60; return m+'m'+(r?r+'s':'');
+  }
+
+  // ---- Graphique BTC live ----
+  const MAX_POINTS = 120; // ~2 min d'historique à 1 point/s
+  let chart = null;
+  let pendingSeed = null;
+  function initChart(){
+    const el = document.getElementById('chart');
+    if(!el) return;
+    const ctx = el.getContext('2d');
+    const grad = ctx.createLinearGradient(0,0,0,240);
+    grad.addColorStop(0,'rgba(0,245,200,.25)');
+    grad.addColorStop(1,'rgba(0,245,200,0)');
+    chart = new Chart(ctx,{
+      type:'line',
+      data:{labels:[],datasets:[{
+        data:[],borderColor:'#00F5C8',borderWidth:2,
+        backgroundColor:grad,fill:true,tension:.25,
+        pointRadius:0,pointHoverRadius:4,pointHoverBackgroundColor:'#00F5C8'
+      }]},
+      options:{
+        responsive:true,maintainAspectRatio:false,animation:false,
+        interaction:{intersect:false,mode:'index'},
+        plugins:{legend:{display:false},tooltip:{
+          backgroundColor:'#0c1219',borderColor:'#1a2530',borderWidth:1,
+          titleColor:'#7c8b95',bodyColor:'#00F5C8',
+          callbacks:{label:c=>' '+Number(c.parsed.y).toLocaleString('fr-FR',{minimumFractionDigits:2,maximumFractionDigits:2})}
+        }},
+        scales:{
+          x:{display:false,grid:{display:false}},
+          y:{position:'right',grid:{color:'rgba(26,37,48,.6)'},
+            ticks:{color:'#7c8b95',font:{size:10},
+              callback:v=>Number(v).toLocaleString('fr-FR',{maximumFractionDigits:0})}}
+        }
+      }
+    });
+    if(pendingSeed){ seedChart(pendingSeed); pendingSeed=null; }
+  }
+  function seedChart(history){
+    if(!history || !history.length) return;
+    if(!chart){ pendingSeed = history; return; }
+    const d = chart.data;
+    d.labels = history.map((_,i)=>i+'');
+    d.datasets[0].data = history.slice();
+    if(d.labels.length>MAX_POINTS){
+      d.labels = d.labels.slice(-MAX_POINTS);
+      d.datasets[0].data = d.datasets[0].data.slice(-MAX_POINTS);
+    }
+    chart.update('none');
+    $('chart-px').textContent = num(history[history.length-1]);
+  }
+  function pushPrice(p){
+    if(!chart) return;
+    const t = new Date().toLocaleTimeString('fr-FR');
+    const d = chart.data;
+    d.labels.push(t); d.datasets[0].data.push(p);
+    if(d.labels.length>MAX_POINTS){ d.labels.shift(); d.datasets[0].data.shift(); }
+    chart.update('none');
+    $('chart-px').textContent = num(p);
   }
 
   function renderIndicators(ind, price){
@@ -854,6 +934,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('run').textContent = s.running ? 'EN MARCHE' : 'PAUSE';
     $('run').className = 'badge ' + (s.running?'on':'off');
     $('asset').textContent = 'Prix Binance live · ' + (s.asset||'BTCUSDT');
+    const pairEl = document.getElementById('chart-pair');
+    if(pairEl) pairEl.textContent = (s.asset||'BTCUSDT').replace('USDT','/USDT') + ' — Binance ' + (s.mode||'testnet').toUpperCase();
     $('s-cap').textContent = '$'+num(s.capital);
     const net = s.stats.net;
     $('s-net').textContent = sign(net)+'$'+num(net);
@@ -880,10 +962,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       renderStats(snap); renderIndicators(snap.indicators, snap.price);
       renderPosition(snap.position); renderOpenPnL(snap.position);
       renderTrades(snap.trades); $('log').innerHTML=(snap.log||[]).join('<br>');
+      seedChart(snap.priceHistory);
     } else if(snap){
       if(m.type==='tick'){
         snap.price=m.price; snap.indicators=m.indicators; snap.position=m.position;
         renderIndicators(m.indicators, m.price); renderPosition(m.position); renderOpenPnL(m.position);
+        pushPrice(m.price);
       }
       if(m.type==='status'){ snap.running=m.running; renderStats(snap); }
       if(m.type==='position'){ snap.position=m.position; renderPosition(m.position); renderOpenPnL(m.position); }
@@ -901,6 +985,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   $('start').onclick = ()=> ws.send(JSON.stringify({action:'start'}));
   $('stop').onclick = ()=> ws.send(JSON.stringify({action:'stop'}));
   $('closeAll').onclick = ()=> ws.send(JSON.stringify({action:'closeAll'}));
+
+  // Init du graphique au chargement
+  window.addEventListener('load', initChart);
 </script>
 </body></html>`;
 
