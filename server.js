@@ -88,6 +88,17 @@ const state = {
   trades: [], // journal
   stats: { wins: 0, losses: 0, gross: 0, fees: 0, net: 0 },
   log: [],
+  // Indicateurs live (calculés à chaque tick, même hors signal)
+  indicators: {
+    emaFast: null,
+    emaSlow: null,
+    momentum: null,
+    quality: null,
+    bias: 'NEUTRE', // LONG / SHORT / NEUTRE
+    nextLev: null,
+  },
+  peakCapital: CAPITAL_START, // pour le drawdown max
+  maxDrawdown: 0,
 };
 
 function logLine(msg) {
@@ -199,6 +210,42 @@ function computeSignal() {
   return { side: bull ? 'BUY' : 'SELL', quality, emaFast, emaSlow, momentum };
 }
 
+// Met à jour les indicateurs live affichés (toujours, même sans signal exploitable)
+function updateIndicators() {
+  const p = state.prices;
+  if (p.length < STRAT.EMA_SLOW + 2) return;
+  const emaFast = ema(p, STRAT.EMA_FAST);
+  const emaSlow = ema(p, STRAT.EMA_SLOW);
+  if (emaFast == null || emaSlow == null) return;
+
+  const last = p[p.length - 1];
+  const prev = p[p.length - 6] || p[0];
+  const momentum = (last - prev) / prev;
+
+  let bias = 'NEUTRE';
+  if (emaFast > emaSlow && momentum > 0) bias = 'LONG';
+  else if (emaFast < emaSlow && momentum < 0) bias = 'SHORT';
+
+  // Quality estimée pour affichage (même logique que computeSignal)
+  const spread = Math.abs(emaFast - emaSlow) / emaSlow;
+  const emaScore = Math.min(30, spread * 5000);
+  const momScore = Math.min(50, Math.abs(momentum) * 8000);
+  const trendBonus =
+    bias === 'LONG' && momentum > 0.001 ? 20 : bias === 'SHORT' && momentum < -0.001 ? 20 : 10;
+  const quality = Math.round(emaScore + momScore + trendBonus);
+
+  const { lev } = sizing(quality);
+
+  state.indicators = {
+    emaFast,
+    emaSlow,
+    momentum,
+    quality: bias === 'NEUTRE' ? null : quality,
+    bias,
+    nextLev: lev,
+  };
+}
+
 function sizing(quality) {
   let stakePct, lev;
   if (quality >= 80) {
@@ -299,7 +346,7 @@ async function openPosition(signal) {
     `🟢 OUVERTURE ${signal.side} ${ASSET} qty=${qty} @ ${entry.toFixed(2)} ` +
       `lev=${lev}x Q=${signal.quality} SL=${slPrice.toFixed(2)} TP=${tpPrice.toFixed(2)}`
   );
-  broadcast({ type: 'position', position: state.position });
+  broadcast({ type: 'position', position: livePosition() });
 }
 
 async function closePosition(reason) {
@@ -328,6 +375,15 @@ async function closePosition(reason) {
   if (net >= 0) state.stats.wins++;
   else state.stats.losses++;
 
+  // Drawdown max (sur le capital)
+  if (state.capital > state.peakCapital) state.peakCapital = state.capital;
+  const dd = (state.peakCapital - state.capital) / state.peakCapital;
+  if (dd > state.maxDrawdown) state.maxDrawdown = dd;
+
+  const durationMs = Date.now() - pos.openedAt;
+  // Rendement sur la marge investie (net / stake)
+  const rendement = (net / pos.stake) * 100;
+
   const trade = {
     side: pos.side,
     entry: pos.entry,
@@ -335,11 +391,15 @@ async function closePosition(reason) {
     qty: pos.qty,
     lev: pos.lev,
     quality: pos.quality,
-    pnlPct: (pnlPct * 100).toFixed(2),
+    investi: pos.stake.toFixed(2), // montant misé (marge)
+    notional: (pos.stake * pos.lev).toFixed(2),
+    pnlPct: (pnlPct * 100).toFixed(2), // variation prix
+    rendement: rendement.toFixed(1), // gain/perte rapporté à la mise
     gross: gross.toFixed(2),
     fees: fees.toFixed(2),
     net: net.toFixed(2),
     reason,
+    durationMs,
     closedAt: Date.now(),
   };
   state.trades.unshift(trade);
@@ -351,7 +411,16 @@ async function closePosition(reason) {
   );
 
   state.position = null;
-  broadcast({ type: 'trade', trade, stats: state.stats, capital: state.capital });
+  const tot = state.stats.wins + state.stats.losses;
+  broadcast({
+    type: 'trade',
+    trade,
+    stats: state.stats,
+    capital: state.capital,
+    winRate: tot ? (state.stats.wins / tot) * 100 : null,
+    maxDrawdown: state.maxDrawdown * 100,
+    position: null,
+  });
 
   // Kill switch
   if (state.capital <= state.capitalStart * (1 - STRAT.KILL_PCT)) {
@@ -445,7 +514,13 @@ function connectPriceStream() {
         state.price = p;
         state.prices.push(p);
         if (state.prices.length > 500) state.prices.shift();
-        broadcast({ type: 'price', price: p });
+        updateIndicators();
+        broadcast({
+          type: 'tick',
+          price: p,
+          indicators: state.indicators,
+          position: livePosition(),
+        });
         tradingTick();
       }
     } catch (e) {
@@ -490,7 +565,36 @@ const server = http.createServer((req, res) => {
   res.end('Not found');
 });
 
+// Position enrichie avec P&L live (unrealized) pour l'affichage "trade en cours"
+function livePosition() {
+  const pos = state.position;
+  if (!pos) return null;
+  const px = state.price || pos.entry;
+  const dir = pos.side === 'BUY' ? 1 : -1;
+  const pnlPct = ((px - pos.entry) / pos.entry) * dir;
+  const gross = pnlPct * pos.stake * pos.lev;
+  const fees = pos.stake * pos.lev * STRAT.FEE_PER_SIDE * 2;
+  const net = gross - fees;
+  return {
+    side: pos.side,
+    entry: pos.entry,
+    current: px,
+    qty: pos.qty,
+    lev: pos.lev,
+    quality: pos.quality,
+    investi: pos.stake,
+    notional: pos.stake * pos.lev,
+    sl: pos.sl,
+    tp: pos.tp,
+    trailing: pos.trailing,
+    pnlPct: pnlPct * 100,
+    netLive: net,
+    openedAt: pos.openedAt,
+  };
+}
+
 function snapshot() {
+  const tot = state.stats.wins + state.stats.losses;
   return {
     mode: state.mode,
     asset: state.asset,
@@ -498,9 +602,12 @@ function snapshot() {
     capital: state.capital,
     capitalStart: state.capitalStart,
     price: state.price,
-    position: state.position,
+    indicators: state.indicators,
+    position: livePosition(),
     stats: state.stats,
-    trades: state.trades.slice(0, 30),
+    winRate: tot ? (state.stats.wins / tot) * 100 : null,
+    maxDrawdown: state.maxDrawdown * 100,
+    trades: state.trades.slice(0, 50),
     log: state.log.slice(0, 50),
   };
 }
@@ -540,103 +647,257 @@ wss.on('connection', (ws) => {
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Itachi Server — Dashboard</title>
+<meta name="theme-color" content="#00F5C8">
+<title>Itachi — CryptoSignal AI</title>
 <style>
-  :root{--bg:#0b0e14;--card:#151a23;--accent:#3b82f6;--green:#22c55e;--red:#ef4444;--txt:#e5e7eb;--mut:#94a3b8}
+  :root{
+    --bg:#070b10;--bg2:#0c1219;--card:#101820;--card2:#0e151d;
+    --cyan:#00F5C8;--cyan-dim:rgba(0,245,200,.12);
+    --green:#22e58a;--red:#ff5470;--amber:#ffb547;
+    --txt:#e7f0ef;--mut:#7c8b95;--line:#1a2530;
+  }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,sans-serif;padding:16px}
-  h1{font-size:18px;margin-bottom:4px}
-  .mut{color:var(--mut);font-size:13px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:16px 0}
-  .card{background:var(--card);border-radius:10px;padding:14px}
-  .card .k{color:var(--mut);font-size:12px;text-transform:uppercase}
-  .card .v{font-size:22px;font-weight:700;margin-top:4px}
-  .green{color:var(--green)}.red{color:var(--red)}
-  .controls{display:flex;gap:8px;margin:16px 0}
-  button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 18px;font-size:14px;font-weight:600;cursor:pointer}
-  button.stop{background:#475569}button.danger{background:var(--red)}
-  table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
-  th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #1f2630}
-  th{color:var(--mut);font-weight:500}
-  .log{background:#0d1117;border-radius:8px;padding:10px;font-family:monospace;font-size:11px;max-height:200px;overflow:auto;color:#9aa4b2}
-  .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600}
-  .on{background:rgba(34,197,94,.15);color:var(--green)}
-  .off{background:rgba(148,163,184,.15);color:var(--mut)}
-  .sec{margin-top:20px}
+  body{background:radial-gradient(1200px 600px at 50% -200px,rgba(0,245,200,.06),transparent),var(--bg);
+    color:var(--txt);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;padding:14px;max-width:1100px;margin:0 auto}
+  .head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+  .logo{font-size:19px;font-weight:800;letter-spacing:.3px}
+  .logo .c{color:var(--cyan)}
+  .badge{display:inline-block;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.5px}
+  .badge.net{background:var(--cyan-dim);color:var(--cyan);border:1px solid rgba(0,245,200,.3)}
+  .badge.on{background:rgba(34,229,138,.15);color:var(--green)}
+  .badge.off{background:rgba(124,139,149,.15);color:var(--mut)}
+  .sub{color:var(--mut);font-size:12px;margin-bottom:14px}
+  .controls{display:flex;gap:8px;margin:14px 0}
+  button{border:0;border-radius:9px;padding:11px 20px;font-size:14px;font-weight:700;cursor:pointer;transition:.15s;font-family:inherit}
+  .btn-go{background:var(--cyan);color:#04221d}.btn-go:hover{box-shadow:0 0 18px rgba(0,245,200,.4)}
+  .btn-stop{background:#1c2630;color:var(--txt)}
+  .btn-kill{background:rgba(255,84,112,.15);color:var(--red);border:1px solid rgba(255,84,112,.3)}
+
+  /* Bandeau indicateurs */
+  .ind-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:1px;
+    background:var(--line);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-bottom:14px}
+  .ind{background:var(--card2);padding:11px 13px}
+  .ind .k{color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.6px}
+  .ind .v{font-size:16px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}
+  .ind .v.cyan{color:var(--cyan)}.ind .v.green{color:var(--green)}.ind .v.red{color:var(--red)}.ind .v.mut{color:var(--mut)}
+
+  /* Cartes stats */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px 15px}
+  .card .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .card .v{font-size:21px;font-weight:800;margin-top:5px;font-variant-numeric:tabular-nums}
+  .green{color:var(--green)}.red{color:var(--red)}.cyan{color:var(--cyan)}.mut{color:var(--mut)}
+
+  .sec-title{font-size:13px;font-weight:700;letter-spacing:.4px;margin:18px 0 8px;color:var(--txt);
+    display:flex;align-items:center;gap:8px}
+  .sec-title .dot{width:6px;height:6px;border-radius:50%;background:var(--cyan)}
+
+  /* Position en cours */
+  .pos-card{background:linear-gradient(180deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:12px;padding:0;overflow:hidden}
+  .pos-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:1px;background:var(--line)}
+  .pos-cell{background:var(--card);padding:11px 13px}
+  .pos-cell .k{color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+  .pos-cell .v{font-size:15px;font-weight:700;margin-top:3px;font-variant-numeric:tabular-nums}
+  .empty{padding:16px;color:var(--mut);font-size:13px;text-align:center}
+  .pill{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:700}
+  .pill.long{background:rgba(34,229,138,.15);color:var(--green)}
+  .pill.short{background:rgba(255,84,112,.15);color:var(--red)}
+
+  /* Table historique */
+  .table-wrap{border:1px solid var(--line);border-radius:12px;overflow-x:auto;background:var(--card2)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:760px}
+  th,td{text-align:right;padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap;font-variant-numeric:tabular-nums}
+  th:first-child,td:first-child{text-align:left}th:nth-child(2),td:nth-child(2){text-align:left}
+  th{color:var(--mut);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;background:var(--card)}
+  tbody tr:hover{background:rgba(0,245,200,.03)}
+
+  .log{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px;
+    font-family:'SF Mono',Consolas,monospace;font-size:11px;max-height:220px;overflow:auto;color:#8aa0a0;line-height:1.7}
 </style></head>
 <body>
-  <h1>⚔️ Itachi Server <span id="mode" class="badge off"></span></h1>
-  <div class="mut" id="asset"></div>
+  <div class="head">
+    <span class="logo">CryptoSignal<span class="c">AI</span> · Itachi</span>
+    <span id="mode" class="badge net">TESTNET</span>
+    <span id="run" class="badge off">PAUSE</span>
+  </div>
+  <div class="sub" id="asset">Prix Binance live · BTC/USDT</div>
 
   <div class="controls">
-    <button id="start">▶ Lancer</button>
-    <button id="stop" class="stop">⏸ Pause</button>
-    <button id="closeAll" class="danger">🧹 Tout fermer</button>
+    <button id="start" class="btn-go">▶ Démarrer</button>
+    <button id="stop" class="btn-stop">⏸ Pause</button>
+    <button id="closeAll" class="btn-kill">⏹ Tout fermer</button>
   </div>
 
+  <!-- Bandeau indicateurs live -->
+  <div class="ind-strip">
+    <div class="ind"><div class="k">Prix réel</div><div class="v cyan" id="i-price">—</div></div>
+    <div class="ind"><div class="k">EMA 8</div><div class="v" id="i-emaf">—</div></div>
+    <div class="ind"><div class="k">EMA 21</div><div class="v" id="i-emas">—</div></div>
+    <div class="ind"><div class="k">Momentum</div><div class="v" id="i-mom">—</div></div>
+    <div class="ind"><div class="k">Force signal</div><div class="v" id="i-q">—</div></div>
+    <div class="ind"><div class="k">Biais</div><div class="v mut" id="i-bias">NEUTRE</div></div>
+    <div class="ind"><div class="k">Levier prochain</div><div class="v" id="i-lev">—</div></div>
+  </div>
+
+  <!-- Cartes stats -->
   <div class="grid">
-    <div class="card"><div class="k">Prix</div><div class="v" id="price">—</div></div>
-    <div class="card"><div class="k">Capital</div><div class="v" id="capital">—</div></div>
-    <div class="card"><div class="k">P&L net</div><div class="v" id="net">—</div></div>
-    <div class="card"><div class="k">Win rate</div><div class="v" id="wr">—</div></div>
-    <div class="card"><div class="k">Trades</div><div class="v" id="ntrades">—</div></div>
+    <div class="card"><div class="k">Capital</div><div class="v" id="s-cap">—</div></div>
+    <div class="card"><div class="k">P&L Net</div><div class="v" id="s-net">—</div></div>
+    <div class="card"><div class="k">P&L Open</div><div class="v" id="s-open">—</div></div>
+    <div class="card"><div class="k">Frais cumulés</div><div class="v mut" id="s-fees">—</div></div>
+    <div class="card"><div class="k">Win Rate</div><div class="v" id="s-wr">—</div></div>
+    <div class="card"><div class="k">Trades</div><div class="v" id="s-n">0</div></div>
+    <div class="card"><div class="k">Gagnés / Perdus</div><div class="v" id="s-wl">0 / 0</div></div>
+    <div class="card"><div class="k">Drawdown Max</div><div class="v" id="s-dd">0.0%</div></div>
   </div>
 
-  <div class="sec"><strong>Position ouverte</strong>
-    <table><tbody id="pos"><tr><td class="mut">Aucune position</td></tr></tbody></table>
+  <!-- Trade en cours -->
+  <div class="sec-title"><span class="dot"></span>Trade en cours</div>
+  <div class="pos-card"><div id="pos"><div class="empty">Aucune position ouverte</div></div></div>
+
+  <!-- Historique -->
+  <div class="sec-title"><span class="dot"></span>Historique — Trades fermés</div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>#</th><th>Sens</th><th>Levier</th><th>Entrée</th><th>Sortie</th>
+        <th>Investi</th><th>Gain/Perte</th><th>Rendement</th><th>Frais</th><th>Raison</th><th>Durée</th>
+      </tr></thead>
+      <tbody id="trades"><tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade fermé pour l'instant</td></tr></tbody>
+    </table>
   </div>
 
-  <div class="sec"><strong>Journal des trades</strong>
-    <table><thead><tr><th>Sens</th><th>Entrée</th><th>Sortie</th><th>P&L %</th><th>Net $</th><th>Raison</th></tr></thead>
-    <tbody id="trades"></tbody></table>
-  </div>
-
-  <div class="sec"><strong>Logs</strong><div class="log" id="log"></div></div>
+  <!-- Logs -->
+  <div class="sec-title"><span class="dot"></span>Journal du bot</div>
+  <div class="log" id="log"></div>
 
 <script>
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(proto + '://' + location.host);
   const $ = id => document.getElementById(id);
+  const num = (n,d=2) => Number(n).toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d});
+  const sign = n => (n>=0?'+':'');
+  const cls = n => n>=0?'green':'red';
 
-  function fmt(n,d=2){return Number(n).toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d})}
-  function render(s){
-    $('mode').textContent = s.mode.toUpperCase();
-    $('mode').className = 'badge ' + (s.running ? 'on':'off');
-    $('asset').textContent = s.asset + (s.running ? ' — EN MARCHE' : ' — EN PAUSE');
-    $('price').textContent = s.price ? fmt(s.price) : '—';
-    $('capital').textContent = '$' + fmt(s.capital);
+  function dur(ms){
+    if(!ms) return '—';
+    const s=Math.floor(ms/1000); if(s<60) return s+'s';
+    const m=Math.floor(s/60); const r=s%60; return m+'m'+(r?r+'s':'');
+  }
+
+  function renderIndicators(ind, price){
+    $('i-price').textContent = price ? num(price) : '—';
+    if(!ind){return;}
+    $('i-emaf').textContent = ind.emaFast!=null ? num(ind.emaFast) : '—';
+    $('i-emas').textContent = ind.emaSlow!=null ? num(ind.emaSlow) : '—';
+    if(ind.momentum!=null){
+      const m=ind.momentum*100;
+      $('i-mom').textContent = sign(m)+m.toFixed(3)+'%';
+      $('i-mom').className = 'v '+cls(m);
+    }
+    $('i-q').textContent = ind.quality!=null ? 'Q'+ind.quality : '—';
+    $('i-q').className = 'v '+(ind.quality!=null && ind.quality>=50 ? 'cyan':'mut');
+    const b = ind.bias||'NEUTRE';
+    $('i-bias').textContent = b;
+    $('i-bias').className = 'v '+(b==='LONG'?'green':b==='SHORT'?'red':'mut');
+    $('i-lev').textContent = ind.nextLev ? ind.nextLev+'×' : '—';
+  }
+
+  function renderPosition(p){
+    const el = $('pos');
+    if(!p){ el.innerHTML = '<div class="empty">Aucune position ouverte</div>'; return; }
+    const sideCls = p.side==='BUY'?'long':'short';
+    const sideTxt = p.side==='BUY'?'LONG':'SHORT';
+    const net = p.netLive!=null ? p.netLive : 0;
+    el.innerHTML =
+      '<div class="pos-row">'+
+      '<div class="pos-cell"><div class="k">Sens</div><div class="v"><span class="pill '+sideCls+'">'+sideTxt+'</span></div></div>'+
+      '<div class="pos-cell"><div class="k">Levier</div><div class="v">'+p.lev+'× · Q'+p.quality+'</div></div>'+
+      '<div class="pos-cell"><div class="k">Entrée</div><div class="v">'+num(p.entry)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">Prix actuel</div><div class="v">'+num(p.current)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">Investi (mise)</div><div class="v">$'+num(p.investi)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">Exposition</div><div class="v">$'+num(p.notional)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">SL</div><div class="v red">'+num(p.sl)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">TP</div><div class="v green">'+num(p.tp)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">P&L live</div><div class="v '+cls(net)+'">'+sign(net)+'$'+num(net)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</div></div>'+
+      '</div>';
+  }
+
+  function renderTrades(trades){
+    const tb = $('trades');
+    if(!trades || !trades.length){
+      tb.innerHTML = '<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade ferm&eacute; pour l&rsquo;instant</td></tr>';
+      return;
+    }
+    tb.innerHTML = trades.map((t,i)=>{
+      const net = Number(t.net);
+      const sideCls = t.side==='BUY'?'long':'short';
+      const sideTxt = t.side==='BUY'?'LONG':'SHORT';
+      return '<tr>'+
+        '<td>'+(trades.length-i)+'</td>'+
+        '<td><span class="pill '+sideCls+'">'+sideTxt+'</span></td>'+
+        '<td>'+t.lev+'×</td>'+
+        '<td>'+num(t.entry)+'</td>'+
+        '<td>'+num(t.exit)+'</td>'+
+        '<td>$'+num(t.investi)+'</td>'+
+        '<td class="'+cls(net)+'">'+sign(net)+'$'+num(net)+'</td>'+
+        '<td class="'+cls(net)+'">'+sign(Number(t.rendement))+t.rendement+'%</td>'+
+        '<td class="mut">$'+num(t.fees)+'</td>'+
+        '<td class="mut">'+t.reason+'</td>'+
+        '<td class="mut">'+dur(t.durationMs)+'</td>'+
+        '</tr>';
+    }).join('');
+  }
+
+  function renderStats(s){
+    $('mode').textContent = (s.mode||'testnet').toUpperCase();
+    $('run').textContent = s.running ? 'EN MARCHE' : 'PAUSE';
+    $('run').className = 'badge ' + (s.running?'on':'off');
+    $('asset').textContent = 'Prix Binance live · ' + (s.asset||'BTCUSDT');
+    $('s-cap').textContent = '$'+num(s.capital);
     const net = s.stats.net;
-    $('net').textContent = (net>=0?'+':'') + '$' + fmt(net);
-    $('net').className = 'v ' + (net>=0?'green':'red');
+    $('s-net').textContent = sign(net)+'$'+num(net);
+    $('s-net').className = 'v '+cls(net);
+    $('s-fees').textContent = '$'+num(s.stats.fees);
     const tot = s.stats.wins + s.stats.losses;
-    $('wr').textContent = tot ? Math.round(s.stats.wins/tot*100)+'%' : '—';
-    $('ntrades').textContent = tot;
-    // position
-    const pb = $('pos');
-    if(s.position){const p=s.position;
-      pb.innerHTML = '<tr><td>'+p.side+'</td><td>entrée '+fmt(p.entry)+'</td><td>SL '+fmt(p.sl)+'</td><td>TP '+fmt(p.tp)+'</td><td>'+p.lev+'x Q'+p.quality+'</td></tr>';
-    } else { pb.innerHTML = '<tr><td class="mut">Aucune position</td></tr>'; }
-    // trades
-    $('trades').innerHTML = (s.trades||[]).map(t=>
-      '<tr><td>'+t.side+'</td><td>'+fmt(t.entry)+'</td><td>'+fmt(t.exit)+'</td><td class="'+(t.net>=0?'green':'red')+'">'+t.pnlPct+'%</td><td class="'+(t.net>=0?'green':'red')+'">'+t.net+'</td><td class="mut">'+t.reason+'</td></tr>'
-    ).join('');
-    // log
-    $('log').innerHTML = (s.log||[]).join('<br>');
+    $('s-wr').textContent = s.winRate!=null ? Math.round(s.winRate)+'%' : (tot?Math.round(s.stats.wins/tot*100)+'%':'—');
+    $('s-wr').className = 'v '+(s.winRate>=50?'green':s.winRate!=null?'red':'mut');
+    $('s-n').textContent = tot;
+    $('s-wl').textContent = s.stats.wins+' / '+s.stats.losses;
+    $('s-dd').textContent = (s.maxDrawdown!=null?s.maxDrawdown:0).toFixed(1)+'%';
+  }
+
+  function renderOpenPnL(p){
+    $('s-open').textContent = p ? (sign(p.netLive)+'$'+num(p.netLive)) : '$0.00';
+    $('s-open').className = 'v '+(p?cls(p.netLive):'mut');
   }
 
   let snap = null;
   ws.onmessage = e => {
     const m = JSON.parse(e.data);
-    if(m.type==='snapshot'){ snap=m.data; render(snap); }
-    else if(snap){
-      if(m.type==='price') snap.price=m.price;
-      if(m.type==='status') snap.running=m.running;
-      if(m.type==='trade'){ snap.trades.unshift(m.trade); snap.stats=m.stats; snap.capital=m.capital; }
-      if(m.type==='position') snap.position=m.position;
-      if(m.type==='log'){ snap.log.unshift(m.line); if(snap.log.length>50)snap.log.pop(); }
-      render(snap);
+    if(m.type==='snapshot'){
+      snap = m.data;
+      renderStats(snap); renderIndicators(snap.indicators, snap.price);
+      renderPosition(snap.position); renderOpenPnL(snap.position);
+      renderTrades(snap.trades); $('log').innerHTML=(snap.log||[]).join('<br>');
+    } else if(snap){
+      if(m.type==='tick'){
+        snap.price=m.price; snap.indicators=m.indicators; snap.position=m.position;
+        renderIndicators(m.indicators, m.price); renderPosition(m.position); renderOpenPnL(m.position);
+      }
+      if(m.type==='status'){ snap.running=m.running; renderStats(snap); }
+      if(m.type==='position'){ snap.position=m.position; renderPosition(m.position); renderOpenPnL(m.position); }
+      if(m.type==='trade'){
+        snap.trades.unshift(m.trade); if(snap.trades.length>50)snap.trades.pop();
+        snap.stats=m.stats; snap.capital=m.capital; snap.winRate=m.winRate; snap.maxDrawdown=m.maxDrawdown;
+        snap.position=null;
+        renderStats(snap); renderTrades(snap.trades); renderPosition(null); renderOpenPnL(null);
+      }
+      if(m.type==='log'){ snap.log.unshift(m.line); if(snap.log.length>50)snap.log.pop(); $('log').innerHTML=snap.log.join('<br>'); }
     }
   };
+  ws.onclose = () => { $('run').textContent='DÉCONNECTÉ'; $('run').className='badge off'; };
+
   $('start').onclick = ()=> ws.send(JSON.stringify({action:'start'}));
   $('stop').onclick = ()=> ws.send(JSON.stringify({action:'stop'}));
   $('closeAll').onclick = ()=> ws.send(JSON.stringify({action:'closeAll'}));
