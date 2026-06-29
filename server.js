@@ -70,6 +70,10 @@ const STRAT = {
   MIN_GAP_MS: 90000, // 90s (1min30) minimum entre 2 tranches
   Q_MIN: 50, // quality minimum pour ouvrir/ajouter
   FEE_PER_SIDE: 0.0004, // 0.04% taker par leg (info P&L)
+  // Calibrage du signal (ajustable selon les conditions de marché)
+  MOM_WINDOW: 20, // nb de ticks pour mesurer le momentum (~20s)
+  MOM_MULT: 25000, // sensibilité du score momentum
+  EMA_MULT: 12000, // sensibilité du score écart EMA
 };
 
 // ------------------------------------------------------------------
@@ -99,6 +103,16 @@ const state = {
   },
   peakCapital: CAPITAL_START, // pour le drawdown max
   maxDrawdown: 0,
+  // Analyse multi-timeframe (rafraîchie périodiquement depuis les vraies bougies Binance)
+  mtf: {
+    alignNorm: null,
+    alignScore: 0,
+    trends: {},
+    rsi1m: null,
+    support: null,
+    resistance: null,
+    updatedAt: 0,
+  },
 };
 
 function logLine(msg) {
@@ -193,21 +207,20 @@ function computeSignal() {
   if (emaFast == null || emaSlow == null) return null;
 
   const last = p[p.length - 1];
-  const prev = p[p.length - 6] || p[0];
-  const momentum = (last - prev) / prev; // variation récente
+  const prev = p[p.length - STRAT.MOM_WINDOW] || p[0];
+  const momentum = (last - prev) / prev; // variation sur la fenêtre
 
   const bull = emaFast > emaSlow && momentum > 0;
   const bear = emaFast < emaSlow && momentum < 0;
   if (!bull && !bear) return null;
 
-  // Quality score 0-100
-  const spread = Math.abs(emaFast - emaSlow) / emaSlow; // écart EMA
-  const emaScore = Math.min(30, spread * 5000); // 0-30
-  const momScore = Math.min(50, Math.abs(momentum) * 8000); // 0-50
-  const trendBonus = bull && momentum > 0.001 ? 20 : bear && momentum < -0.001 ? 20 : 10;
-  const quality = Math.round(emaScore + momScore + trendBonus);
+  // Score de base (EMA + momentum) — la partie MTF/RSI/SR est ajoutée dans tradingTick
+  const spread = Math.abs(emaFast - emaSlow) / emaSlow;
+  const emaScore = Math.min(20, spread * STRAT.EMA_MULT); // 0-20
+  const momScore = Math.min(20, Math.abs(momentum) * STRAT.MOM_MULT); // 0-20
+  const baseQ = emaScore + momScore;
 
-  return { side: bull ? 'BUY' : 'SELL', quality, emaFast, emaSlow, momentum };
+  return { side: bull ? 'BUY' : 'SELL', baseQ, emaScore, momScore, emaFast, emaSlow, momentum };
 }
 
 // Met à jour les indicateurs live affichés (toujours, même sans signal exploitable)
@@ -219,28 +232,29 @@ function updateIndicators() {
   if (emaFast == null || emaSlow == null) return;
 
   const last = p[p.length - 1];
-  const prev = p[p.length - 6] || p[0];
+  const prev = p[p.length - STRAT.MOM_WINDOW] || p[0];
   const momentum = (last - prev) / prev;
 
   let bias = 'NEUTRE';
   if (emaFast > emaSlow && momentum > 0) bias = 'LONG';
   else if (emaFast < emaSlow && momentum < 0) bias = 'SHORT';
 
-  // Quality estimée pour affichage (même logique que computeSignal)
-  const spread = Math.abs(emaFast - emaSlow) / emaSlow;
-  const emaScore = Math.min(30, spread * 5000);
-  const momScore = Math.min(50, Math.abs(momentum) * 8000);
-  const trendBonus =
-    bias === 'LONG' && momentum > 0.001 ? 20 : bias === 'SHORT' && momentum < -0.001 ? 20 : 10;
-  const quality = Math.round(emaScore + momScore + trendBonus);
-
-  const { lev } = sizing(quality);
+  // Score complet pour affichage (même logique que le scoring de trade)
+  const sig = bias === 'NEUTRE' ? null : { side: bias === 'LONG' ? 'BUY' : 'SELL', momentum };
+  const q = sig ? scoreQuality(sig) : null;
+  const { lev } = sizing(q != null ? q.quality : 0);
 
   state.indicators = {
     emaFast,
     emaSlow,
     momentum,
-    quality: bias === 'NEUTRE' ? null : quality,
+    rsi: state.mtf.rsi1m,
+    quality: q ? q.quality : null,
+    breakdown: q ? q.breakdown : null,
+    mtfAlign: state.mtf.alignScore,
+    mtfTrends: state.mtf.trends,
+    support: state.mtf.support,
+    resistance: state.mtf.resistance,
     bias,
     nextLev: lev,
   };
@@ -259,6 +273,153 @@ function sizing(quality) {
     lev = STRAT.LEV_LOW;
   }
   return { stake: state.capital * stakePct, lev };
+}
+
+// ------------------------------------------------------------------
+// ANALYSE MULTI-TIMEFRAME (vraies bougies Binance) + RSI + S/R
+// ------------------------------------------------------------------
+const TIMEFRAMES = ['1m', '3m', '5m', '15m', '1h'];
+// Poids de chaque TF dans l'alignement (les TF longs comptent plus)
+const TF_WEIGHTS = { '1m': 1, '3m': 1, '5m': 1.5, '15m': 2, '1h': 2.5 };
+
+function emaFromCloses(closes, period) {
+  if (closes.length < period) return null;
+  const k = 2 / (period + 1);
+  let e = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < closes.length; i++) e = closes[i] * k + e * (1 - k);
+  return e;
+}
+
+function rsi(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff; else losses -= diff;
+  }
+  const avgG = gains / period, avgL = losses / period;
+  if (avgL === 0) return 100;
+  const rs = avgG / avgL;
+  return 100 - 100 / (1 + rs);
+}
+
+// Récupère les bougies d'un timeframe et en déduit tendance + S/R
+async function fetchTF(tf) {
+  try {
+    const kl = await publicRequest('/fapi/v1/klines', { symbol: ASSET, interval: tf, limit: 50 });
+    const closes = kl.map((c) => parseFloat(c[4]));
+    const highs = kl.map((c) => parseFloat(c[2]));
+    const lows = kl.map((c) => parseFloat(c[3]));
+    const ef = emaFromCloses(closes, 9);
+    const es = emaFromCloses(closes, 21);
+    let trend = 0; // +1 haussier, -1 baissier, 0 neutre
+    if (ef != null && es != null) trend = ef > es ? 1 : ef < es ? -1 : 0;
+    // Support/résistance = plus bas/haut récents (20 dernières bougies)
+    const recentHighs = highs.slice(-20);
+    const recentLows = lows.slice(-20);
+    return {
+      trend,
+      resistance: Math.max(...recentHighs),
+      support: Math.min(...recentLows),
+      lastClose: closes[closes.length - 1],
+      closes,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Rafraîchit l'analyse MTF complète (appelée périodiquement, pas à chaque tick)
+async function refreshMTF() {
+  if (state.price <= 0) return;
+  const results = {};
+  for (const tf of TIMEFRAMES) {
+    const r = await fetchTF(tf);
+    if (r) results[tf] = r;
+  }
+  if (!Object.keys(results).length) return;
+
+  // Score d'alignement : somme pondérée des tendances, normalisée sur [-1, 1]
+  let weighted = 0, totalW = 0;
+  const trends = {};
+  for (const tf of TIMEFRAMES) {
+    if (!results[tf]) continue;
+    const w = TF_WEIGHTS[tf];
+    weighted += results[tf].trend * w;
+    totalW += w;
+    trends[tf] = results[tf].trend;
+  }
+  const alignNorm = totalW ? weighted / totalW : 0; // -1 (tout baissier) à +1 (tout haussier)
+
+  // RSI sur 1m
+  const rsi1m = results['1m'] ? rsi(results['1m'].closes, 14) : null;
+
+  // S/R les plus pertinents : 15m et 1h
+  const sr = results['15m'] || results['1h'];
+
+  state.mtf = {
+    alignNorm, // direction et force de l'alignement
+    alignScore: Math.abs(alignNorm), // 0 à 1
+    trends, // tendance par TF (pour affichage)
+    rsi1m,
+    support: sr ? sr.support : null,
+    resistance: sr ? sr.resistance : null,
+    updatedAt: Date.now(),
+  };
+}
+
+// ------------------------------------------------------------------
+// SCORING DU SIGNAL — combine base (EMA+mom) + RSI + MTF + S/R
+// ------------------------------------------------------------------
+function scoreQuality(signal) {
+  const p = state.prices;
+  const emaFast = ema(p, STRAT.EMA_FAST);
+  const emaSlow = ema(p, STRAT.EMA_SLOW);
+  const spread = emaSlow ? Math.abs(emaFast - emaSlow) / emaSlow : 0;
+  const emaScore = Math.min(20, spread * STRAT.EMA_MULT); // 0-20
+  const momScore = Math.min(20, Math.abs(signal.momentum) * STRAT.MOM_MULT); // 0-20
+
+  const isLong = signal.side === 'BUY';
+  const mtf = state.mtf;
+
+  // RSI : favorise l'achat en survente, la vente en surachat (0-15)
+  let rsiScore = 0;
+  if (mtf.rsi1m != null) {
+    if (isLong) rsiScore = mtf.rsi1m < 30 ? 15 : mtf.rsi1m < 45 ? 10 : mtf.rsi1m < 60 ? 5 : 0;
+    else rsiScore = mtf.rsi1m > 70 ? 15 : mtf.rsi1m > 55 ? 10 : mtf.rsi1m > 40 ? 5 : 0;
+  }
+
+  // Alignement MTF (0-30) — LE GROS BOOST quand les TF s'accordent dans le bon sens
+  let mtfScore = 0;
+  if (mtf.alignNorm != null) {
+    const aligned = isLong ? mtf.alignNorm : -mtf.alignNorm; // >0 si le marché va dans notre sens
+    mtfScore = Math.max(0, Math.min(30, aligned * 30));
+  }
+
+  // Position vs Support/Résistance (0-15)
+  let srScore = 0;
+  const px = state.price;
+  if (mtf.support && mtf.resistance && px > 0) {
+    const range = mtf.resistance - mtf.support;
+    if (range > 0) {
+      const posInRange = (px - mtf.support) / range; // 0 = sur support, 1 = sur résistance
+      // LONG : bonus si proche du support (marge de hausse). SHORT : si proche résistance.
+      if (isLong) srScore = posInRange < 0.4 ? 15 : posInRange < 0.6 ? 8 : 2;
+      else srScore = posInRange > 0.6 ? 15 : posInRange > 0.4 ? 8 : 2;
+    }
+  }
+
+  const quality = Math.round(emaScore + momScore + rsiScore + mtfScore + srScore);
+  return {
+    quality,
+    breakdown: {
+      ema: Math.round(emaScore),
+      mom: Math.round(momScore),
+      rsi: Math.round(rsiScore),
+      mtf: Math.round(mtfScore),
+      sr: Math.round(srScore),
+    },
+  };
 }
 
 // ------------------------------------------------------------------
@@ -337,12 +498,15 @@ async function openOrAddTranche(signal) {
 
   // Délai minimum entre 2 tranches
   if (now - state.lastEntryAt < STRAT.MIN_GAP_MS) return;
-  if (signal.quality < STRAT.Q_MIN) return;
+
+  // Score de qualité complet : EMA + momentum + RSI + alignement MTF + S/R
+  const q = scoreQuality(signal);
+  if (q.quality < STRAT.Q_MIN) return;
 
   // Limite de tranches atteinte
   if (state.position && state.position.tranches.length >= STRAT.MAX_TRANCHES) return;
 
-  const { stake, lev } = sizing(signal.quality);
+  const { stake, lev } = sizing(q.quality);
   const notional = stake * lev;
   const qty = roundQty(notional / state.price);
   if (qty <= 0) return;
@@ -365,7 +529,8 @@ async function openOrAddTranche(signal) {
     entry,
     qty,
     stake,
-    quality: signal.quality,
+    quality: q.quality,
+    breakdown: q.breakdown,
     openedAt: now,
   };
 
@@ -808,6 +973,30 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .chart-head .px{font-size:15px;font-weight:800;color:var(--cyan);font-variant-numeric:tabular-nums}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
   .chart-box{position:relative;height:240px}
+
+  /* Bandeau multi-timeframe */
+  .mtf-strip{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;
+    background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:10px}
+  .mtf-trends{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .mtf-label{font-size:10px;color:var(--mut);letter-spacing:.6px;margin-right:4px}
+  .tf{display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border-radius:7px;background:var(--card);border:1px solid var(--line);font-size:12px}
+  .tf b{font-size:11px;color:var(--mut)}
+  .tf i{font-style:normal;font-weight:800}
+  .tf.up i{color:var(--green)} .tf.down i{color:var(--red)} .tf.flat i{color:var(--mut)}
+  .tf.up{border-color:rgba(34,229,138,.3)} .tf.down{border-color:rgba(255,84,112,.3)}
+  .mtf-extra{display:flex;gap:16px;flex-wrap:wrap}
+  .mtf-item{display:flex;flex-direction:column;font-variant-numeric:tabular-nums}
+  .mtf-item b{font-size:14px;font-weight:700}
+
+  /* Décomposition du Q */
+  .q-break{display:flex;gap:8px;flex-wrap:wrap;align-items:stretch;margin-bottom:14px}
+  .qb{display:flex;flex-direction:column;gap:2px;background:var(--card2);border:1px solid var(--line);
+    border-radius:9px;padding:7px 12px;font-variant-numeric:tabular-nums}
+  .qb b{font-size:15px;font-weight:800}
+  .qb.hl{border-color:rgba(0,245,200,.35);background:var(--cyan-dim)}
+  .qb.hl b{color:var(--cyan)}
+  .qb.total{margin-left:auto;flex-direction:row;align-items:baseline;gap:7px}
+  .qb.total b{font-size:20px;color:var(--cyan)}
 </style></head>
 <body>
   <div class="head">
@@ -832,6 +1021,34 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="ind"><div class="k">Force signal</div><div class="v" id="i-q">—</div></div>
     <div class="ind"><div class="k">Biais</div><div class="v mut" id="i-bias">NEUTRE</div></div>
     <div class="ind"><div class="k">Levier prochain</div><div class="v" id="i-lev">—</div></div>
+  </div>
+
+  <!-- Bandeau multi-timeframe + RSI + S/R -->
+  <div class="mtf-strip">
+    <div class="mtf-trends">
+      <span class="mtf-label">TENDANCES</span>
+      <span class="tf" id="tf-1m"><b>1m</b><i>—</i></span>
+      <span class="tf" id="tf-3m"><b>3m</b><i>—</i></span>
+      <span class="tf" id="tf-5m"><b>5m</b><i>—</i></span>
+      <span class="tf" id="tf-15m"><b>15m</b><i>—</i></span>
+      <span class="tf" id="tf-1h"><b>1h</b><i>—</i></span>
+    </div>
+    <div class="mtf-extra">
+      <span class="mtf-item"><span class="trk">RSI 1m</span><b id="m-rsi">—</b></span>
+      <span class="mtf-item"><span class="trk">Align. MTF</span><b id="m-align">—</b></span>
+      <span class="mtf-item"><span class="trk">Support</span><b id="m-sup" class="green">—</b></span>
+      <span class="mtf-item"><span class="trk">Résistance</span><b id="m-res" class="red">—</b></span>
+    </div>
+  </div>
+
+  <!-- Décomposition du Quality score -->
+  <div class="q-break" id="q-break">
+    <span class="qb"><span class="trk">EMA</span><b id="qb-ema">0</b></span>
+    <span class="qb"><span class="trk">Mom.</span><b id="qb-mom">0</b></span>
+    <span class="qb"><span class="trk">RSI</span><b id="qb-rsi">0</b></span>
+    <span class="qb hl"><span class="trk">MTF</span><b id="qb-mtf">0</b></span>
+    <span class="qb"><span class="trk">S/R</span><b id="qb-sr">0</b></span>
+    <span class="qb total"><span class="trk">Q total</span><b id="qb-tot">0</b><span class="trk">/ 50 requis</span></span>
   </div>
 
   <!-- Graphique BTC live (calé sur Binance testnet) -->
@@ -948,6 +1165,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('chart-px').textContent = num(p);
   }
 
+  function setTF(id, trend){
+    const el = $(id); if(!el) return;
+    const i = el.querySelector('i');
+    if(trend>0){ el.className='tf up'; i.textContent='▲ HAUSSE'; }
+    else if(trend<0){ el.className='tf down'; i.textContent='▼ BAISSE'; }
+    else { el.className='tf flat'; i.textContent='— PLAT'; }
+  }
+
   function renderIndicators(ind, price){
     $('i-price').textContent = price ? num(price) : '—';
     if(!ind){return;}
@@ -964,6 +1189,32 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('i-bias').textContent = b;
     $('i-bias').className = 'v '+(b==='LONG'?'green':b==='SHORT'?'red':'mut');
     $('i-lev').textContent = ind.nextLev ? ind.nextLev+'×' : '—';
+
+    // Tendances multi-timeframe
+    const tr = ind.mtfTrends||{};
+    setTF('tf-1m', tr['1m']||0); setTF('tf-3m', tr['3m']||0); setTF('tf-5m', tr['5m']||0);
+    setTF('tf-15m', tr['15m']||0); setTF('tf-1h', tr['1h']||0);
+
+    // RSI / alignement / S/R
+    if(ind.rsi!=null){
+      $('m-rsi').textContent = ind.rsi.toFixed(0);
+      $('m-rsi').className = ind.rsi>70?'red':ind.rsi<30?'green':'';
+    }
+    $('m-align').textContent = ind.mtfAlign!=null ? Math.round(ind.mtfAlign*100)+'%' : '—';
+    $('m-sup').textContent = ind.support!=null ? num(ind.support) : '—';
+    $('m-res').textContent = ind.resistance!=null ? num(ind.resistance) : '—';
+
+    // Décomposition du Q
+    const bd = ind.breakdown;
+    if(bd){
+      $('qb-ema').textContent = bd.ema; $('qb-mom').textContent = bd.mom;
+      $('qb-rsi').textContent = bd.rsi; $('qb-mtf').textContent = bd.mtf; $('qb-sr').textContent = bd.sr;
+      const tot = ind.quality!=null?ind.quality:0;
+      $('qb-tot').textContent = tot;
+      $('qb-tot').style.color = tot>=50 ? 'var(--green)' : 'var(--cyan)';
+    } else {
+      ['qb-ema','qb-mom','qb-rsi','qb-mtf','qb-sr','qb-tot'].forEach(id=>$(id).textContent='0');
+    }
   }
 
   function renderPosition(p){
@@ -1107,6 +1358,8 @@ async function start() {
   }
   await loadSymbolInfo();
   connectPriceStream();
+  refreshMTF(); // première analyse multi-timeframe au démarrage
+  setInterval(refreshMTF, 20000); // analyse MTF toutes les 20s (vraies bougies Binance)
   setInterval(reconcile, 9000); // réconciliation toutes les 9s
   server.listen(PORT, () => logLine(`🌐 Dashboard sur le port ${PORT}`));
 }
