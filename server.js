@@ -66,9 +66,9 @@ const STRAT = {
   TRAIL_PCT: 0.005, // -0.5% trailing après TP atteint
   KILL_PCT: 0.20, // -20% capital => arrêt total
   // Garde-fous
-  MAX_POSITIONS: 2, // positions simultanées max
-  MIN_GAP_MS: 30000, // 30s minimum entre 2 entrées
-  Q_MIN: 50, // quality minimum pour ouvrir
+  MAX_TRANCHES: 5, // pyramiding : nombre max de tranches sur la position BTC
+  MIN_GAP_MS: 90000, // 90s (1min30) minimum entre 2 tranches
+  Q_MIN: 50, // quality minimum pour ouvrir/ajouter
   FEE_PER_SIDE: 0.0004, // 0.04% taker par leg (info P&L)
 };
 
@@ -301,50 +301,102 @@ async function fetchBinancePosition() {
 // ------------------------------------------------------------------
 // LOGIQUE D'OUVERTURE / FERMETURE
 // ------------------------------------------------------------------
-async function openPosition(signal) {
+// OUVERTURE / AJOUT DE TRANCHE (pyramiding)
+// ------------------------------------------------------------------
+// Recalcule le prix d'entrée moyen pondéré + SL/TP global de la position
+function recomputePosition() {
+  const pos = state.position;
+  if (!pos || !pos.tranches.length) return;
+  let totalQty = 0;
+  let weighted = 0;
+  let totalStake = 0;
+  for (const t of pos.tranches) {
+    totalQty += t.qty;
+    weighted += t.entry * t.qty;
+    totalStake += t.stake;
+  }
+  pos.qty = roundQty(totalQty);
+  pos.avgEntry = weighted / totalQty;
+  pos.stake = totalStake;
+  // SL/TP global basés sur le prix d'entrée moyen
+  pos.sl =
+    pos.side === 'BUY'
+      ? pos.avgEntry * (1 - STRAT.SL_PCT)
+      : pos.avgEntry * (1 + STRAT.SL_PCT);
+  pos.tp =
+    pos.side === 'BUY'
+      ? pos.avgEntry * (1 + STRAT.TP_PCT)
+      : pos.avgEntry * (1 - STRAT.TP_PCT);
+}
+
+async function openOrAddTranche(signal) {
   const now = Date.now();
-  if (state.position) return;
+
+  // Si une position existe déjà : on n'ajoute que dans le MÊME sens
+  if (state.position && state.position.side !== signal.side) return;
+
+  // Délai minimum entre 2 tranches
   if (now - state.lastEntryAt < STRAT.MIN_GAP_MS) return;
   if (signal.quality < STRAT.Q_MIN) return;
+
+  // Limite de tranches atteinte
+  if (state.position && state.position.tranches.length >= STRAT.MAX_TRANCHES) return;
 
   const { stake, lev } = sizing(signal.quality);
   const notional = stake * lev;
   const qty = roundQty(notional / state.price);
   if (qty <= 0) return;
 
-  await setLeverage(lev);
+  // Le levier est fixé sur la 1re tranche (Binance applique 1 levier par symbole)
+  const useLev = state.position ? state.position.lev : lev;
+  if (!state.position) await setLeverage(useLev);
 
   try {
     await marketOrder(signal.side, qty);
   } catch (e) {
-    logLine(`❌ Ouverture échouée: ${e.message}`);
+    logLine(`❌ Entrée échouée: ${e.message}`);
     return;
   }
 
   const entry = state.price;
-  const slPrice =
-    signal.side === 'BUY' ? entry * (1 - STRAT.SL_PCT) : entry * (1 + STRAT.SL_PCT);
-  const tpPrice =
-    signal.side === 'BUY' ? entry * (1 + STRAT.TP_PCT) : entry * (1 - STRAT.TP_PCT);
-
-  state.position = {
+  const tranche = {
+    n: state.position ? state.position.tranches.length + 1 : 1,
     side: signal.side,
     entry,
     qty,
     stake,
-    lev,
     quality: signal.quality,
-    sl: slPrice,
-    tp: tpPrice,
-    peak: entry,
-    trailing: false,
     openedAt: now,
   };
+
+  if (!state.position) {
+    // Première tranche → création de la position
+    state.position = {
+      side: signal.side,
+      lev: useLev,
+      tranches: [tranche],
+      qty: 0,
+      avgEntry: 0,
+      stake: 0,
+      sl: 0,
+      tp: 0,
+      peak: entry,
+      trailing: false,
+      openedAt: now,
+    };
+  } else {
+    // Tranche supplémentaire → pyramiding
+    state.position.tranches.push(tranche);
+  }
+
+  recomputePosition();
   state.lastEntryAt = now;
 
   logLine(
-    `🟢 OUVERTURE ${signal.side} ${ASSET} qty=${qty} @ ${entry.toFixed(2)} ` +
-      `lev=${lev}x Q=${signal.quality} SL=${slPrice.toFixed(2)} TP=${tpPrice.toFixed(2)}`
+    `🟢 ${tranche.n === 1 ? 'OUVERTURE' : 'TRANCHE #' + tranche.n} ${signal.side} ${ASSET} ` +
+      `qty=${qty} @ ${entry.toFixed(2)} | pos totale=${state.position.qty} ` +
+      `entrée moy=${state.position.avgEntry.toFixed(2)} ` +
+      `SL=${state.position.sl.toFixed(2)} TP=${state.position.tp.toFixed(2)}`
   );
   broadcast({ type: 'position', position: livePosition() });
 }
@@ -363,7 +415,7 @@ async function closePosition(reason) {
 
   const exit = state.price;
   const dir = pos.side === 'BUY' ? 1 : -1;
-  const pnlPct = ((exit - pos.entry) / pos.entry) * dir;
+  const pnlPct = ((exit - pos.avgEntry) / pos.avgEntry) * dir;
   const gross = pnlPct * pos.stake * pos.lev;
   const fees = pos.stake * pos.lev * STRAT.FEE_PER_SIDE * 2;
   const net = gross - fees;
@@ -386,12 +438,13 @@ async function closePosition(reason) {
 
   const trade = {
     side: pos.side,
-    entry: pos.entry,
+    entry: pos.avgEntry,
     exit,
     qty: pos.qty,
     lev: pos.lev,
-    quality: pos.quality,
-    investi: pos.stake.toFixed(2), // montant misé (marge)
+    tranches: pos.tranches.length,
+    quality: pos.tranches[0] ? pos.tranches[0].quality : null,
+    investi: pos.stake.toFixed(2), // montant misé total (marge)
     notional: (pos.stake * pos.lev).toFixed(2),
     pnlPct: (pnlPct * 100).toFixed(2), // variation prix
     rendement: rendement.toFixed(1), // gain/perte rapporté à la mise
@@ -406,7 +459,7 @@ async function closePosition(reason) {
   if (state.trades.length > 100) state.trades.pop();
 
   logLine(
-    `🔴 FERMETURE ${pos.side} @ ${exit.toFixed(2)} | ${reason} | ` +
+    `🔴 FERMETURE ${pos.side} ${pos.tranches.length} tranche(s) @ ${exit.toFixed(2)} | ${reason} | ` +
       `net=${net.toFixed(2)}$ | capital=${state.capital.toFixed(2)}$`
   );
 
@@ -436,7 +489,7 @@ function managePosition() {
   if (!pos) return;
   const px = state.price;
   const dir = pos.side === 'BUY' ? 1 : -1;
-  const pnlPct = ((px - pos.entry) / pos.entry) * dir;
+  const pnlPct = ((px - pos.avgEntry) / pos.avgEntry) * dir;
 
   // Mise à jour du pic (dans le sens favorable uniquement)
   if (pos.side === 'BUY' && px > pos.peak) pos.peak = px;
@@ -473,15 +526,13 @@ function managePosition() {
 async function tradingTick() {
   if (!state.running || state.price <= 0) return;
 
-  // 1. Gérer la position en cours (SL/TP/trailing)
+  // 1. Gérer la position en cours (SL/TP/trailing global)
   managePosition();
 
-  // 2. Chercher une nouvelle entrée si pas de position
-  if (!state.position) {
-    const signal = computeSignal();
-    if (signal) {
-      await openPosition(signal);
-    }
+  // 2. Chercher une entrée (nouvelle position OU tranche supplémentaire de pyramiding)
+  const signal = computeSignal();
+  if (signal) {
+    await openOrAddTranche(signal);
   }
 }
 
@@ -565,23 +616,44 @@ const server = http.createServer((req, res) => {
   res.end('Not found');
 });
 
-// Position enrichie avec P&L live (unrealized) pour l'affichage "trade en cours"
+// Position enrichie avec P&L live (unrealized) + détail des tranches
 function livePosition() {
   const pos = state.position;
   if (!pos) return null;
-  const px = state.price || pos.entry;
+  const px = state.price || pos.avgEntry;
   const dir = pos.side === 'BUY' ? 1 : -1;
-  const pnlPct = ((px - pos.entry) / pos.entry) * dir;
+
+  // P&L global (sur le prix d'entrée moyen)
+  const pnlPct = ((px - pos.avgEntry) / pos.avgEntry) * dir;
   const gross = pnlPct * pos.stake * pos.lev;
   const fees = pos.stake * pos.lev * STRAT.FEE_PER_SIDE * 2;
   const net = gross - fees;
+
+  // Détail par tranche (P&L calculé depuis le prix d'entrée de chaque tranche)
+  const tranches = pos.tranches.map((t) => {
+    const tPnlPct = ((px - t.entry) / t.entry) * dir;
+    const tGross = tPnlPct * t.stake * pos.lev;
+    const tFees = t.stake * pos.lev * STRAT.FEE_PER_SIDE * 2;
+    return {
+      n: t.n,
+      entry: t.entry,
+      qty: t.qty,
+      investi: t.stake,
+      quality: t.quality,
+      pnlPct: tPnlPct * 100,
+      netLive: tGross - tFees,
+      openedAt: t.openedAt,
+    };
+  });
+
   return {
     side: pos.side,
-    entry: pos.entry,
+    avgEntry: pos.avgEntry,
     current: px,
     qty: pos.qty,
     lev: pos.lev,
-    quality: pos.quality,
+    nbTranches: pos.tranches.length,
+    maxTranches: STRAT.MAX_TRANCHES,
     investi: pos.stake,
     notional: pos.stake * pos.lev,
     sl: pos.sl,
@@ -590,6 +662,7 @@ function livePosition() {
     pnlPct: pnlPct * 100,
     netLive: net,
     openedAt: pos.openedAt,
+    tranches,
   };
 }
 
@@ -705,6 +778,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .pill.long{background:rgba(34,229,138,.15);color:var(--green)}
   .pill.short{background:rgba(255,84,112,.15);color:var(--red)}
 
+  /* Pyramiding : tranches */
+  .pos-global-title{padding:9px 13px;font-size:11px;font-weight:700;color:var(--cyan);
+    background:var(--cyan-dim);border-bottom:1px solid var(--line);letter-spacing:.3px}
+  .tranches{display:flex;flex-direction:column;gap:1px;background:var(--line);border-top:1px solid var(--line)}
+  .tranche-row{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--card);padding:9px 13px;font-size:12.5px}
+  .tr-badge{display:inline-block;min-width:30px;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:800;
+    background:rgba(0,245,200,.12);color:var(--cyan);text-align:center}
+  .tr-cell{font-variant-numeric:tabular-nums}
+  .trk{color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.4px;margin-right:3px}
+
   /* Table historique */
   .table-wrap{border:1px solid var(--line);border-radius:12px;overflow-x:auto;background:var(--card2)}
   table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:760px}
@@ -781,7 +864,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>#</th><th>Sens</th><th>Levier</th><th>Entrée</th><th>Sortie</th>
+        <th>#</th><th>Sens</th><th>Tranches</th><th>Levier</th><th>Entrée moy.</th><th>Sortie</th>
         <th>Investi</th><th>Gain/Perte</th><th>Rendement</th><th>Frais</th><th>Raison</th><th>Durée</th>
       </tr></thead>
       <tbody id="trades"><tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade fermé pour l'instant</td></tr></tbody>
@@ -889,24 +972,46 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     const sideCls = p.side==='BUY'?'long':'short';
     const sideTxt = p.side==='BUY'?'LONG':'SHORT';
     const net = p.netLive!=null ? p.netLive : 0;
-    el.innerHTML =
+
+    // Bandeau "Position globale Binance" (la vérité)
+    let html =
+      '<div class="pos-global">'+
+      '<div class="pos-global-title">📊 Position globale Binance — '+p.nbTranches+'/'+p.maxTranches+' tranche(s)</div>'+
       '<div class="pos-row">'+
       '<div class="pos-cell"><div class="k">Sens</div><div class="v"><span class="pill '+sideCls+'">'+sideTxt+'</span></div></div>'+
-      '<div class="pos-cell"><div class="k">Levier</div><div class="v">'+p.lev+'× · Q'+p.quality+'</div></div>'+
-      '<div class="pos-cell"><div class="k">Entrée</div><div class="v">'+num(p.entry)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">Levier</div><div class="v">'+p.lev+'×</div></div>'+
+      '<div class="pos-cell"><div class="k">Entrée moyenne</div><div class="v">'+num(p.avgEntry)+'</div></div>'+
       '<div class="pos-cell"><div class="k">Prix actuel</div><div class="v">'+num(p.current)+'</div></div>'+
-      '<div class="pos-cell"><div class="k">Investi (mise)</div><div class="v">$'+num(p.investi)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">Investi total</div><div class="v">$'+num(p.investi)+'</div></div>'+
       '<div class="pos-cell"><div class="k">Exposition</div><div class="v">$'+num(p.notional)+'</div></div>'+
-      '<div class="pos-cell"><div class="k">SL</div><div class="v red">'+num(p.sl)+'</div></div>'+
-      '<div class="pos-cell"><div class="k">TP</div><div class="v green">'+num(p.tp)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">SL global</div><div class="v red">'+num(p.sl)+'</div></div>'+
+      '<div class="pos-cell"><div class="k">TP global</div><div class="v green">'+num(p.tp)+'</div></div>'+
       '<div class="pos-cell"><div class="k">P&L live</div><div class="v '+cls(net)+'">'+sign(net)+'$'+num(net)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</div></div>'+
-      '</div>';
+      '</div></div>';
+
+    // Détail des tranches
+    if(p.tranches && p.tranches.length){
+      html += '<div class="tranches">';
+      p.tranches.forEach(t=>{
+        const tnet = t.netLive!=null ? t.netLive : 0;
+        html +=
+          '<div class="tranche-row">'+
+          '<span class="tr-badge">#'+t.n+'</span>'+
+          '<span class="tr-cell"><span class="trk">Entrée</span> '+num(t.entry)+'</span>'+
+          '<span class="tr-cell"><span class="trk">Mise</span> $'+num(t.investi)+'</span>'+
+          '<span class="tr-cell"><span class="trk">Q</span> '+t.quality+'</span>'+
+          '<span class="tr-cell '+cls(tnet)+'">'+sign(tnet)+'$'+num(tnet)+' ('+sign(t.pnlPct)+t.pnlPct.toFixed(2)+'%)</span>'+
+          '</div>';
+      });
+      html += '</div>';
+    }
+    el.innerHTML = html;
   }
 
   function renderTrades(trades){
     const tb = $('trades');
     if(!trades || !trades.length){
-      tb.innerHTML = '<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade ferm&eacute; pour l&rsquo;instant</td></tr>';
+      tb.innerHTML = '<tr><td colspan="12" class="mut" style="text-align:center;padding:14px">Aucun trade ferm&eacute; pour l&rsquo;instant</td></tr>';
       return;
     }
     tb.innerHTML = trades.map((t,i)=>{
@@ -916,6 +1021,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       return '<tr>'+
         '<td>'+(trades.length-i)+'</td>'+
         '<td><span class="pill '+sideCls+'">'+sideTxt+'</span></td>'+
+        '<td>'+(t.tranches||1)+'</td>'+
         '<td>'+t.lev+'×</td>'+
         '<td>'+num(t.entry)+'</td>'+
         '<td>'+num(t.exit)+'</td>'+
@@ -1001,7 +1107,7 @@ async function start() {
   }
   await loadSymbolInfo();
   connectPriceStream();
-  setInterval(reconcile, 15000); // réconciliation toutes les 15s
+  setInterval(reconcile, 9000); // réconciliation toutes les 9s
   server.listen(PORT, () => logLine(`🌐 Dashboard sur le port ${PORT}`));
 }
 
