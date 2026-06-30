@@ -68,8 +68,12 @@ const STRAT = {
   LEV_MED: 5,
   LEV_HIGH: 8,
 
-  // --- Cadence ---
+  // --- Cadence & sortie temporelle intelligente ---
   MIN_GAP_MS: 90000, // 90s minimum entre 2 entrées (même symbole)
+  TIME_EXIT_FROM: 60000, // début de la fenêtre de décision de sortie (60s)
+  TIME_EXIT_HARD: 120000, // sortie forcée absolue (120s) — on ne traîne jamais au-delà
+  TIME_EXIT_GIVEBACK: 0.004, // en profit : sort si le prix retombe de 0.4% sous le pic
+  TIME_EXIT_WORSENING: -0.006, // en perte : coupe net si la perte dépasse -0.6%
   TF_PRINCIPAL: '5m', // timeframe d'analyse principal
 };
 
@@ -493,19 +497,48 @@ function managePosition(symbol) {
   const px = S.price;
   const dir = pos.side === 'BUY' ? 1 : -1;
   const pnlPct = ((px - pos.entry) / pos.entry) * dir;
+  const age = Date.now() - pos.openedAt;
 
   if (pos.side === 'BUY' && px > pos.peak) pos.peak = px;
   if (pos.side === 'SELL' && px < pos.peak) pos.peak = px;
 
+  // Suivi du creux (pour détecter un rebond quand on est en perte)
+  if (pos.trough == null) pos.trough = px;
+  if (pos.side === 'BUY' && px < pos.trough) pos.trough = px;
+  if (pos.side === 'SELL' && px > pos.trough) pos.trough = px;
+
   if (!pos.trailing && pnlPct >= STRAT.TRAIL_START) pos.trailing = true;
 
+  // --- Règles classiques (priorité absolue) ---
   if (pos.trailing) {
     const draw = pos.side === 'BUY' ? (pos.peak - px) / pos.peak : (px - pos.peak) / pos.peak;
     if (draw >= STRAT.TRAIL_PCT) { closePos(symbol, 'TRAILING'); return; }
   } else if (pnlPct <= -STRAT.SL_PCT) {
-    closePos(symbol, 'STOP-LOSS');
+    closePos(symbol, 'STOP-LOSS'); return;
   } else if (pnlPct >= STRAT.TP_PCT) {
-    closePos(symbol, 'TAKE-PROFIT');
+    closePos(symbol, 'TAKE-PROFIT'); return;
+  }
+
+  // --- Sortie temporelle intelligente (au meilleur moment, pas brutale) ---
+  if (age >= STRAT.TIME_EXIT_HARD) {
+    // Plafond dur : on ne traîne jamais au-delà
+    closePos(symbol, 'TEMPS-MAX');
+    return;
+  }
+  if (age >= STRAT.TIME_EXIT_FROM) {
+    // Fenêtre de décision : on choisit le meilleur moment pour sortir
+    if (pnlPct > 0) {
+      // En profit : sécuriser dès que le prix retombe sous le pic (ne pas rendre le gain)
+      const giveback = pos.side === 'BUY' ? (pos.peak - px) / pos.peak : (px - pos.peak) / pos.peak;
+      if (giveback >= STRAT.TIME_EXIT_GIVEBACK) { closePos(symbol, 'TEMPS-PROFIT'); return; }
+    } else if (pnlPct <= STRAT.TIME_EXIT_WORSENING) {
+      // Perte qui s'aggrave : couper net, ne pas espérer
+      closePos(symbol, 'TEMPS-PERTE'); return;
+    } else {
+      // Légère perte / quasi nul : attendre un rebond depuis le creux pour sortir au moins pire
+      const rebound = pos.side === 'BUY' ? (px - pos.trough) / pos.trough : (pos.trough - px) / pos.trough;
+      if (rebound >= STRAT.TIME_EXIT_GIVEBACK) { closePos(symbol, 'TEMPS-REBOND'); return; }
+    }
   }
 }
 
@@ -602,9 +635,12 @@ function livePositions() {
 function symbolsOverview() {
   return ALL_SYMBOLS.map((symbol) => {
     const S = state.sym[symbol];
+    // Échantillon de prix pour mini-courbe (40 derniers points max)
+    const spark = S.prices.slice(-40);
     return {
       symbol, price: S.price, bias: S.indicators.bias, quality: S.indicators.quality,
       rsi: S.indicators.rsi, align: S.mtf.alignNorm, hasPosition: !!S.position,
+      spark,
     };
   });
 }
@@ -742,13 +778,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="sec"><span class="dot"></span>Surveillance des 20 symboles</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Prix</th><th>Biais</th><th>Q</th><th>RSI</th><th>Align. MTF</th><th>Statut</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Prix</th><th>Courbe</th><th>Biais</th><th>Q</th><th>RSI</th><th>Align. MTF</th><th>Statut</th></tr></thead>
     <tbody id="symbols"></tbody>
   </table></div>
 
   <div class="sec"><span class="dot"></span>Historique des trades</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Net $</th><th>Raison</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Net $</th><th>Frais</th><th>Raison</th></tr></thead>
     <tbody id="trades"></tbody>
   </table></div>
 
@@ -792,6 +828,22 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }).join('');
   }
 
+  function sparkline(data){
+    if(!data || data.length < 2) return '<span class="mut">—</span>';
+    const w=72, h=22, n=data.length;
+    const min=Math.min(...data), max=Math.max(...data);
+    const range=(max-min)||1;
+    const pts=data.map((v,i)=>{
+      const x=(i/(n-1))*w;
+      const y=h-((v-min)/range)*h;
+      return x.toFixed(1)+','+y.toFixed(1);
+    }).join(' ');
+    const up=data[data.length-1]>=data[0];
+    const col=up?'#22e58a':'#ff5470';
+    return '<svg width="'+w+'" height="'+h+'" viewBox="0 0 '+w+' '+h+'" style="vertical-align:middle">'+
+      '<polyline points="'+pts+'" fill="none" stroke="'+col+'" stroke-width="1.5"/></svg>';
+  }
+
   function renderSymbols(list){
     const tb=$('symbols');
     tb.innerHTML=(list||[]).map(s=>{
@@ -801,6 +853,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       const qcol=s.quality>=48?'cyan':'mut';
       const al=s.align!=null?Math.round(s.align*100)+'%':'—';
       return '<tr><td>'+s.symbol+'</td><td>'+(s.price?px(s.price):'—')+'</td>'+
+        '<td>'+sparkline(s.spark)+'</td>'+
         '<td><span class="pill '+bc+'">'+b+'</span></td>'+
         '<td class="qbadge '+qcol+'">'+q+'</td>'+
         '<td>'+(s.rsi!=null?s.rsi.toFixed(0):'—')+'</td>'+
@@ -811,13 +864,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function renderTrades(list){
     const tb=$('trades');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="9" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
+    if(!list||!list.length){tb.innerHTML='<tr><td colspan="10" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
     tb.innerHTML=list.map(t=>{
       const net=Number(t.net),sc=t.side==='BUY'?'long':'short',st=t.side==='BUY'?'LONG':'SHORT';
       return '<tr><td>'+t.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
         '<td>'+px(t.entry)+'</td><td>'+px(t.exit)+'</td><td>$'+num(t.investi)+'</td>'+
         '<td class="'+cls(net)+'">'+sign(Number(t.pnlPct))+t.pnlPct+'%</td>'+
-        '<td class="'+cls(net)+'">'+sign(net)+'$'+num(net)+'</td><td class="mut">'+t.reason+'</td></tr>';
+        '<td class="'+cls(net)+'">'+sign(net)+'$'+num(net)+'</td>'+
+        '<td class="mut">$'+num(t.fees)+'</td>'+
+        '<td class="mut">'+t.reason+'</td></tr>';
     }).join('');
   }
 
@@ -827,6 +882,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if(m.type==='snapshot'){snap=m.data;renderStats(snap);renderPositions(snap.positions);renderSymbols(snap.symbols);renderTrades(snap.trades);$('log').innerHTML=(snap.log||[]).join('<br>');}
     else if(snap){
       if(m.type==='status'){snap.running=m.running;renderStats(snap);}
+      if(m.type==='symbols'){snap.symbols=m.symbols;renderSymbols(m.symbols);}
       if(m.type==='positions'){snap.positions=m.positions;renderPositions(m.positions);}
       if(m.type==='trade'){snap.stats=m.stats;snap.capital=m.capital;snap.positions=m.positions;renderStats(snap);renderPositions(m.positions);}
       if(m.type==='log'){snap.log.unshift(m.line);if(snap.log.length>50)snap.log.pop();$('log').innerHTML=snap.log.join('<br>');}
@@ -851,6 +907,7 @@ async function start() {
   connectPriceStreams();
   setInterval(refreshAllKlines, 30000);
   setInterval(reconcile, 9000);
+  setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 3000); // mini-courbes vivantes
   server.listen(PORT, () => logLine(`🌐 Dashboard sur le port ${PORT}`));
 }
 
