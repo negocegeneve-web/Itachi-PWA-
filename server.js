@@ -1,14 +1,22 @@
 /* ============================================================
- *  SERVEUR 3 — Itachi Multi (correction du win rate)
+ *  SERVEUR 5 — Itachi Multi (MEAN-REVERSION, univers Binance complet)
  *  ------------------------------------------------------------
- *  Base = Serveur 2 + 4 corrections ciblant la cause du WR 23% :
- *   1. TP baissé (+1.0% base) + fenêtre 120s -> 150s (+30s)
- *   2. MTF restauré 0.10 -> 0.25 (sélectivité de tendance)
- *   3. Trailing IMMÉDIAT dès +0.4% (capture les petits gains)
- *   4. SL/TP ADAPTATIFS sur l'ATR (objectifs calibrés volatilité)
- *      + garde-fou ratio SL<=TP sur actifs très volatils.
- *  => Objectif : remplacer les sorties TEMPS-MAX à plat par des
- *     TAKE-PROFIT et TRAILING réels. À VALIDER au /backtest.
+ *  Philosophie OPPOSÉE aux serveurs 1-4 (qui suivent la tendance).
+ *  Ici on parie CONTRE les excès (retour à la moyenne) :
+ *    - SHORT si sur-acheté : RSI >= 70 ET prix étendu > 1.5x ATR au-dessus EMA
+ *    - LONG  si sur-vendu  : RSI <= 30 ET prix étendu > 1.5x ATR sous EMA
+ *    - SL -0.6% / TP +1.2% (ratio 2:1, SL serré obligatoire)
+ *    - AUCUN filtre de tendance 1h (choix utilisateur — le + risqué)
+ *
+ *  Univers DYNAMIQUE : scan de TOUT Binance Futures toutes les 5 min.
+ *    Pipeline : USDT only -> exclu TradFi -> volume 24h > 50M$ ->
+ *    amplitude 24h > 3% -> tri par volatilité -> top tradés.
+ *    WebSocket prix re-souscrit quand l'univers change.
+ *
+ *  ⚠️ AVERTISSEMENT du concepteur : RSI 70/30 + aucun filtre 1h =
+ *  combinaison la plus risquée. Le bot shortera des tendances
+ *  haussières réelles. À VALIDER impérativement au /backtest.
+ *  Le SL -0.6% et le kill -35% sont les seuls garde-fous.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -50,21 +58,32 @@ const KLINE_BASE = 'https://fapi.binance.com'; // bougies depuis mainnet (testne
 // PARAMÈTRES STRATÉGIE 2,5:1 (ajustables ici)
 // ==================================================================
 const STRAT = {
-  // --- Ratio risque/récompense (SL/TP de base, désormais calibrés par l'ATR) ---
-  // TP baissé : un objectif atteignable dans la fenêtre de temps courte.
-  SL_PCT: 0.006, // -0.6% stop-loss de base (plancher)
-  TP_PCT: 0.010, // +1.0% take-profit de base (au lieu de +2.5% inatteignable en 2-2.5min)
+  // --- STRATÉGIE MEAN-REVERSION (retour à la moyenne) — OPPOSÉE au trend-following ---
+  // On parie CONTRE les excès : prix sur-étendu vers le haut -> SHORT ; trop bas -> LONG.
+  MEAN_REVERSION: true,
+  MR_RSI_HIGH: 70, // RSI > 70 -> excès haussier -> on SHORT (agressif)
+  MR_RSI_LOW: 30,  // RSI < 30 -> excès baissier -> on LONG (agressif)
+  MR_EXT_ATR_MULT: 1.5, // prix doit être à > 1.5x ATR de l'EMA pour confirmer l'extension
+  MR_MASTER_FILTER: false, // AUCUN filtre de tendance 1h (choix utilisateur — le + risqué)
+  MR_Q_MIN: 25, // seuil Q minimal en mean-reversion (bas : le filtre RSI+extension fait le tri)
 
-  // --- SL/TP ADAPTATIFS sur l'ATR (calibrés sur la volatilité réelle de chaque actif) ---
-  USE_ATR_EXITS: true, // si true et ATR dispo : SL/TP = multiples de l'ATR (sinon SL_PCT/TP_PCT)
-  ATR_SL_MULT: 1.0, // SL = entrée -/+ 1.0 x ATR
-  ATR_TP_MULT: 2.0, // TP = entrée +/- 2.0 x ATR (ratio 2:1 calibré sur la volatilité)
-  ATR_TP_CAP: 0.018, // plafond de sécurité : le TP ATR ne dépasse jamais +1.8%
-  ATR_TP_FLOOR: 0.006, // plancher : le TP ATR n'est jamais sous +0.6%
+  // --- Univers DYNAMIQUE : tout Binance Futures, filtré par liquidité ---
+  DYNAMIC_UNIVERSE: true,
+  QUOTE_ASSET: 'USDT', // on ne garde que les paires USDT
+  VOLUME_MIN_USD: 50000000, // volume notionnel 24h minimum (liquidité) = 50M$
+  VOL_MIN_24H_PCT: 0.03, // amplitude 24h minimum 3% (sinon trop calme pour du mean-reversion)
+  UNIVERSE_MAX: 140, // plafond de l'univers liquide (garde-fou)
+  EXCLUDE_TRADFI: true, // exclut les contrats actions (SONY, KLAC, LRCX, ALAB, SMCI, CIEN...)
 
-  // --- Trailing IMMÉDIAT : on protège le gain dès le premier profit ---
-  TRAIL_START: 0.004, // active le trailing dès +0.4% (au lieu de +1.5%)
-  TRAIL_PCT: 0.004, // -0.4% du pic une fois le trailing actif (capture les petits gains)
+  // --- Ratio risque/récompense (SL serré obligatoire en mean-reversion) ---
+  SL_PCT: 0.006, // -0.6% stop-loss (serré : on coupe vite si le pump continue)
+  TP_PCT: 0.012, // +1.2% take-profit => ratio 2:1
+  USE_ATR_EXITS: false, // en mean-reversion on garde des niveaux fixes serrés (pas ATR)
+  ATR_SL_MULT: 1.0, ATR_TP_MULT: 2.0, ATR_TP_CAP: 0.018, ATR_TP_FLOOR: 0.006,
+
+  // --- Trailing ---
+  TRAIL_START: 0.006, // active le trailing après +0.6% (mi-chemin du TP)
+  TRAIL_PCT: 0.004, // -0.4% du pic
 
   // --- Sélectivité (Q adaptatif 50-55 selon volatilité du marché) ---
   Q_MIN_CALM: 55, // marché calme : on exige plus (moins de vrais signaux)
@@ -137,15 +156,27 @@ const TIMEFRAMES = ['1m', '5m', '15m', '1h'];
 const TF_WEIGHTS = { '1m': 1, '5m': 1.5, '15m': 2, '1h': 2.5 };
 
 // ==================================================================
-// UNIVERS DE SYMBOLES — 20 cryptos en 4 catégories
+// UNIVERS DE SYMBOLES — DYNAMIQUE (tout Binance Futures filtré par liquidité)
+// La liste ci-dessous n'est qu'une SEED de démarrage ; scanUniverse() la remplace
+// par les symboles les plus volatils parmi les plus liquides, recalculés toutes les 5 min.
 // ==================================================================
-const SYMBOLS = {
-  major: ['BTCUSDT', 'ETHUSDT'], // 2 majeurs
-  largeCap: ['BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT'], // 8 grandes caps
-  volatile: ['NEARUSDT', 'APTUSDT', 'ARBUSDT', 'OPUSDT', 'INJUSDT', 'SEIUSDT', 'SUIUSDT'], // 7 volatils
-  ultraVolatile: ['PEPEUSDT', 'WIFUSDT', 'BONKUSDT'], // 3 très très volatils
-};
-const ALL_SYMBOLS = [...SYMBOLS.major, ...SYMBOLS.largeCap, ...SYMBOLS.volatile, ...SYMBOLS.ultraVolatile];
+const SEED_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT'];
+let ALL_SYMBOLS = [...SEED_SYMBOLS]; // mutable : devient l'univers liquide courant
+
+// Contrats "TradFi" (actions tokenisées) à exclure — ils ne suivent pas la dynamique crypto.
+const TRADFI_EXCLUDE = ['SONYUSDT', 'KLACUSDT', 'LRCXUSDT', 'ALABUSDT', 'SMCIUSDT', 'CIENUSDT', 'KORUUSDT', 'NVDAUSDT', 'AAPLUSDT', 'TSLAUSDT', 'MSFTUSDT', 'METAUSDT', 'AMZNUSDT', 'GOOGLUSDT'];
+
+// Crée l'entrée d'état d'un symbole s'il n'existe pas déjà (univers dynamique).
+function ensureSymbol(s) {
+  if (state.sym[s]) return;
+  state.sym[s] = {
+    symbol: s, price: 0, prices: [], klines: [],
+    indicators: { emaFast: null, emaSlow: null, rsi: null, momentum: null, bias: 'NEUTRE', quality: null, breakdown: null, excConditions: 0 },
+    mtf: { alignNorm: null, trends: {}, support: null, resistance: null },
+    short: { atrPct: null, mom: null, masterTrend: 0 },
+    position: null, lastEntryAt: 0, busy: false,
+  };
+}
 
 // ==================================================================
 // PALIERS DE FRÉQUENCE — plus le capital monte, plus on ouvre de positions
@@ -178,15 +209,7 @@ const state = {
   activeSymbols: null, // sous-ensemble des N meilleurs symboles à trader (null = tous au démarrage)
 };
 
-for (const s of ALL_SYMBOLS) {
-  state.sym[s] = {
-    symbol: s, price: 0, prices: [], klines: [],
-    indicators: { emaFast: null, emaSlow: null, rsi: null, momentum: null, bias: 'NEUTRE', quality: null, breakdown: null, excConditions: 0 },
-    mtf: { alignNorm: null, trends: {}, support: null, resistance: null },
-    short: { atrPct: null, mom: null, masterTrend: 0 }, // frame courte 1m (volatilité + momentum)
-    position: null, lastEntryAt: 0, busy: false,
-  };
-}
+for (const s of ALL_SYMBOLS) ensureSymbol(s);
 
 function logLine(msg) {
   const line = `[${new Date().toISOString()}] ${msg}`;
@@ -259,7 +282,9 @@ async function loadSymbolInfo() {
   try {
     const info = await publicGet(REST_BASE, '/fapi/v1/exchangeInfo');
     for (const sym of info.symbols) {
-      if (ALL_SYMBOLS.includes(sym.symbol)) {
+      // Univers dynamique : on charge TOUTES les paires USDT perpétuelles d'un coup,
+      // pour que tout symbole entrant dans l'univers ait déjà ses précisions.
+      if (sym.symbol.endsWith('USDT')) {
         const lot = sym.filters.find((f) => f.filterType === 'LOT_SIZE');
         SYMBOL_INFO[sym.symbol] = {
           qtyPrecision: sym.quantityPrecision,
@@ -383,29 +408,42 @@ function computeSignal(symbol) {
   const prev = p[p.length - STRAT.MOM_WINDOW] || p[0];
   const momentum = (last - prev) / prev;
 
-  const bull = emaFast > emaSlow && momentum > 0;
-  const bear = emaFast < emaSlow && momentum < 0;
+  const rsiNow = S.indicators.rsi;
+
+  // ===== LOGIQUE MEAN-REVERSION : on parie CONTRE l'excès =====
+  // SHORT si sur-acheté (RSI haut + prix étendu au-dessus de l'EMA).
+  // LONG  si sur-vendu  (RSI bas  + prix étendu en-dessous de l'EMA).
+  const atr = S.short.atrPct;
+  const extUp = emaSlow > 0 ? (last - emaSlow) / emaSlow : 0;   // extension au-dessus EMA (en %)
+  const extDown = emaSlow > 0 ? (emaSlow - last) / emaSlow : 0; // extension en-dessous EMA
+  const minExt = (atr != null && atr > 0) ? atr * STRAT.MR_EXT_ATR_MULT : 0.004;
+
+  let mrShort = false, mrLong = false;
+  if (rsiNow != null) {
+    mrShort = rsiNow >= STRAT.MR_RSI_HIGH && extUp >= minExt;   // sur-acheté + étendu en haut
+    mrLong  = rsiNow <= STRAT.MR_RSI_LOW  && extDown >= minExt; // sur-vendu + étendu en bas
+  }
 
   S.indicators.emaFast = emaFast;
   S.indicators.emaSlow = emaSlow;
   S.indicators.momentum = momentum;
-  S.indicators.bias = bull ? 'LONG' : bear ? 'SHORT' : 'NEUTRE';
+  S.indicators.bias = mrLong ? 'LONG(MR)' : mrShort ? 'SHORT(MR)' : 'NEUTRE';
 
-  if (!bull && !bear) { S.indicators.quality = null; return null; }
-  const isLong = bull;
+  if (!mrShort && !mrLong) { S.indicators.quality = null; return null; }
+  const isLong = mrLong;
 
-  // Alignement MTF ALLÉGÉ (0.10 au lieu de 0.30) — débloque les trades
-  const align = S.mtf.alignNorm;
-  const aligned = isLong ? align : -align;
-  if (STRAT.MTF_REQUIRED && (align == null || aligned <= STRAT.MTF_MIN_ALIGN)) {
-    S.indicators.quality = null;
-    return null;
+  // Filtre de tendance maître 1h : DÉSACTIVÉ (MR_MASTER_FILTER=false, choix utilisateur).
+  // (si réactivé : bloquerait le SHORT en 1h haussière et le LONG en 1h baissière)
+  if (STRAT.MR_MASTER_FILTER) {
+    const master = S.short.masterTrend || 0;
+    if (isLong && master > 0) { S.indicators.quality = null; return null; }
+    if (!isLong && master < 0) { S.indicators.quality = null; return null; }
   }
 
-  // Filtre tendance maître (1h) — léger : on refuse seulement le contre-sens FRANC.
-  const master = S.short.masterTrend || 0;
-  if (isLong && master < 0 && aligned < 0.25) { S.indicators.quality = null; return null; }
-  if (!isLong && master > 0 && aligned < 0.25) { S.indicators.quality = null; return null; }
+  // Pour le scoring, "aligned" = force de l'extension qu'on contre (plus c'est étendu, mieux c'est)
+  const extension = isLong ? extDown : extUp;
+  const aligned = Math.min(1, extension / (minExt * 2)); // normalisé 0..1
+  const align = aligned;
 
   const spread = Math.abs(emaFast - emaSlow) / emaSlow;
   const emaScore = Math.min(20, spread * STRAT.EMA_MULT);
@@ -575,7 +613,7 @@ async function tryOpen(symbol, signal) {
   // Ne trader que les symboles actifs du moment (top-N dynamique)
   if (state.activeSymbols && !state.activeSymbols.includes(symbol)) return;
   if (now - S.lastEntryAt < STRAT.MIN_GAP_MS) return;
-  if (signal.quality < qMinFor(symbol)) return;
+  if (signal.quality < (STRAT.MEAN_REVERSION ? STRAT.MR_Q_MIN : qMinFor(symbol))) return;
 
   // Le timer de la porte 2 se réarme dès qu'un setup parfait 4/4 se présente
   // (qu'on le trade ou non) : la porte 2 ne doit s'ouvrir QUE faute de 4/4.
@@ -782,11 +820,60 @@ async function reconcile() {
 // ==================================================================
 // WEBSOCKET PRIX (multi-stream)
 // ==================================================================
+// ==================================================================
+// SCAN DE L'UNIVERS DYNAMIQUE — tout Binance Futures filtré par liquidité
+// 1 seul appel REST renvoie les stats 24h de TOUS les symboles.
+// Pipeline : USDT only -> exclu TradFi -> volume>50M$ -> amplitude>3% -> tri volatilité.
+// ==================================================================
+async function scanUniverse() {
+  if (!STRAT.DYNAMIC_UNIVERSE) return;
+  try {
+    const all = await publicGet(KLINE_BASE, '/fapi/v1/ticker/24hr');
+    if (!Array.isArray(all)) return;
+
+    const candidates = [];
+    for (const t of all) {
+      const sym = t.symbol;
+      if (!sym.endsWith(STRAT.QUOTE_ASSET)) continue; // USDT only
+      if (STRAT.EXCLUDE_TRADFI && TRADFI_EXCLUDE.includes(sym)) continue;
+      const quoteVol = parseFloat(t.quoteVolume); // volume notionnel 24h en USDT
+      if (!(quoteVol >= STRAT.VOLUME_MIN_USD)) continue; // filtre liquidité
+      const high = parseFloat(t.highPrice), low = parseFloat(t.lowPrice);
+      if (!(low > 0)) continue;
+      const amplitude = (high - low) / low; // volatilité 24h
+      if (!(amplitude >= STRAT.VOL_MIN_24H_PCT)) continue; // filtre volatilité min
+      candidates.push({ sym, quoteVol, amplitude });
+    }
+
+    // Tri par volatilité décroissante, plafonné à UNIVERSE_MAX
+    candidates.sort((a, b) => b.amplitude - a.amplitude);
+    const universe = candidates.slice(0, STRAT.UNIVERSE_MAX).map((c) => c.sym);
+
+    // On garde toujours les symboles déjà en position (pour continuer à les gérer)
+    for (const s of Object.keys(state.sym)) {
+      if (state.sym[s].position && !universe.includes(s)) universe.push(s);
+    }
+    if (universe.length === 0) universe.push(...SEED_SYMBOLS); // sécurité
+
+    for (const s of universe) ensureSymbol(s);
+    ALL_SYMBOLS = universe;
+    logLine(`🌍 Univers scanné : ${candidates.length} liquides>50M$, top ${universe.length} retenus (vol. max ${(candidates[0] ? candidates[0].amplitude * 100 : 0).toFixed(1)}%)`);
+  } catch (e) {
+    logLine(`⚠️ scanUniverse: ${e.message}`);
+  }
+}
+
+let priceWs = null;
+let priceWsSymbols = '';
 function connectPriceStreams() {
-  const streams = ALL_SYMBOLS.map((s) => `${s.toLowerCase()}@markPrice@1s`).join('/');
+  // Binance limite la longueur d'URL : on plafonne le nombre de streams souscrits.
+  const subList = ALL_SYMBOLS.slice(0, 180);
+  const streams = subList.map((s) => `${s.toLowerCase()}@markPrice@1s`).join('/');
+  priceWsSymbols = streams;
   const url = `${WS_BASE}/stream?streams=${streams}`;
   const ws = new WebSocket(url);
-  ws.on('open', () => logLine(`🔌 WebSocket prix connecté (${MODE}) — ${ALL_SYMBOLS.length} symboles`));
+  priceWs = ws;
+  ws.on('open', () => logLine(`🔌 WebSocket prix connecté (${MODE}) — ${subList.length} symboles`));
   ws.on('message', (raw) => {
     try {
       const msg = JSON.parse(raw);
@@ -802,8 +889,20 @@ function connectPriceStreams() {
       }
     } catch (e) { /* ignore */ }
   });
-  ws.on('close', () => { logLine('⚠️ WS prix fermé — reconnexion 3s'); setTimeout(connectPriceStreams, 3000); });
+  ws.on('close', () => { if (priceWs === ws) { logLine('⚠️ WS prix fermé — reconnexion 3s'); setTimeout(connectPriceStreams, 3000); } });
   ws.on('error', (e) => logLine(`⚠️ WS error: ${e.message}`));
+}
+
+// Reconnecte le flux prix si l'univers a changé (nouveau scan).
+function resubscribeIfChanged() {
+  const subList = ALL_SYMBOLS.slice(0, 180);
+  const streams = subList.map((s) => `${s.toLowerCase()}@markPrice@1s`).join('/');
+  if (streams !== priceWsSymbols && priceWs) {
+    logLine('🔄 Univers modifié — re-souscription des flux prix.');
+    const old = priceWs; priceWs = null; // empêche la reconnexion auto du close
+    try { old.close(); } catch (e) { /* ignore */ }
+    connectPriceStreams();
+  }
 }
 
 async function refreshAllKlines() {
@@ -889,7 +988,7 @@ function snapshot() {
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
     trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
-    strat: { sl: STRAT.SL_PCT * 100, tp: STRAT.TP_PCT * 100, qMin: STRAT.Q_MIN_VOLATILE, qMax: STRAT.Q_MIN_CALM, ratio: STRAT.TP_PCT / STRAT.SL_PCT },
+    strat: { sl: STRAT.SL_PCT * 100, tp: STRAT.TP_PCT * 100, qMin: STRAT.Q_MIN_VOLATILE, qMax: STRAT.Q_MIN_CALM, ratio: STRAT.TP_PCT / STRAT.SL_PCT, rsiLow: STRAT.MR_RSI_LOW, rsiHigh: STRAT.MR_RSI_HIGH, meanRev: !!STRAT.MEAN_REVERSION },
   };
 }
 
@@ -1043,7 +1142,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -35%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q '+(s.strat?s.strat.qMin:50)+'-'+(s.strat?s.strat.qMax:55)+' adaptatif · levier 2-7x · top 15/20';
+    $('stratline').textContent='MEAN-REVERSION '+(s.strat?s.strat.ratio.toFixed(1):'2')+':1 · SL -'+(s.strat?s.strat.sl:0.6)+'% / TP +'+(s.strat?s.strat.tp:1.2)+'% · RSI '+(s.strat&&s.strat.rsiLow!=null?s.strat.rsiLow:30)+'/'+(s.strat&&s.strat.rsiHigh!=null?s.strat.rsiHigh:70)+' · univers Binance dynamique';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1144,14 +1243,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`🚀 Itachi Multi — ${MODE.toUpperCase()} — ${ALL_SYMBOLS.length} symboles — capital $${CAPITAL_START}`);
-  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q ${STRAT.Q_MIN_VOLATILE}-${STRAT.Q_MIN_CALM} adaptatif — levier 2-7x — top ${STRAT.ACTIVE_TOP_N}/${ALL_SYMBOLS.length}`);
+  logLine(`🚀 Itachi Multi — SERVEUR 5 (mean-reversion, univers dynamique) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`📐 Mean-reversion ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — RSI ${STRAT.MR_RSI_LOW}/${STRAT.MR_RSI_HIGH} — filtre 1h ${STRAT.MR_MASTER_FILTER ? 'ON' : 'OFF'}`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
+  await scanUniverse(); // 1er scan : remplace la seed par l'univers liquide réel
   await refreshAllKlines();
   connectPriceStreams();
   setInterval(refreshAllKlines, 30000);
-  setInterval(rankActiveSymbols, STRAT.RANK_REFRESH_MS); // re-classement top-N toutes les 5 min
+  setInterval(async () => { await scanUniverse(); resubscribeIfChanged(); }, STRAT.RANK_REFRESH_MS); // re-scan univers + re-souscription, toutes les 5 min
+  setInterval(rankActiveSymbols, STRAT.RANK_REFRESH_MS); // re-classement top-N parmi l'univers
   setInterval(reconcile, 9000);
   setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 3000); // mini-courbes vivantes
   server.listen(PORT, () => logLine(`🌐 Dashboard sur le port ${PORT}`));
