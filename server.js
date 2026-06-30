@@ -1,14 +1,20 @@
 /* ============================================================
- *  SERVEUR 3 — Itachi Multi (correction du win rate)
+ *  SERVEUR 3.2 — Itachi Multi (config haute fréquence/exposition)
  *  ------------------------------------------------------------
- *  Base = Serveur 2 + 4 corrections ciblant la cause du WR 23% :
- *   1. TP baissé (+1.0% base) + fenêtre 120s -> 150s (+30s)
- *   2. MTF restauré 0.10 -> 0.25 (sélectivité de tendance)
- *   3. Trailing IMMÉDIAT dès +0.4% (capture les petits gains)
- *   4. SL/TP ADAPTATIFS sur l'ATR (objectifs calibrés volatilité)
- *      + garde-fou ratio SL<=TP sur actifs très volatils.
- *  => Objectif : remplacer les sorties TEMPS-MAX à plat par des
- *     TAKE-PROFIT et TRAILING réels. À VALIDER au /backtest.
+ *  = Serveur 3 avec réglages utilisateur :
+ *   - Délai entre trades (même symbole) : 14 min
+ *   - 10 à 20 positions simultanées (plafond dur 20)
+ *   - Exposition montée à 90% du capital (pour permettre ce nombre)
+ *   - Kill switch (stop bot) : -45%
+ *   - Q d'entrée : 40-50 (zone basse, plus de trades)
+ *   - Levier x3 -> x12 indexé sur Q (x12 réservé Q>=80 + mise 9%)
+ *   - MTF allégé de moitié : 0.25 -> 0.125
+ *  Conserve du Serveur 3 : SL/TP ATR, trailing immédiat, mises
+ *  4.5%/9%, sortie explosive, top-15 dynamique sur les 20 symboles.
+ *
+ *  ⚠️ AVERTISSEMENT : config la PLUS exposée à ce jour. 20 positions
+ *  x levier jusqu'à x12 + expo 90% = risque maximal. Q bas (40) =
+ *  signaux faibles admis. À VALIDER au /backtest avant le réel.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -67,10 +73,10 @@ const STRAT = {
   TRAIL_PCT: 0.004, // -0.4% du pic une fois le trailing actif (capture les petits gains)
 
   // --- Sélectivité (Q adaptatif 50-55 selon volatilité du marché) ---
-  Q_MIN_CALM: 55, // marché calme : on exige plus (moins de vrais signaux)
-  Q_MIN_VOLATILE: 50, // marché agité : on accepte plus bas (plus d'opportunités)
+  Q_MIN_CALM: 50, // marché calme : seuil haut de la zone d'entrée 40-50
+  Q_MIN_VOLATILE: 40, // marché agité : seuil bas 40 (plus d'opportunités)
   MTF_REQUIRED: true, // alignement multi-timeframe requis...
-  MTF_MIN_ALIGN: 0.25, // ...RESTAURÉ à 0.25 : on retrouve la sélectivité de tendance qui marchait
+  MTF_MIN_ALIGN: 0.125, // ...ALLÉGÉ DE MOITIÉ (0.25 -> 0.125) : laisse passer + de signaux
 
   // --- Indicateurs ---
   EMA_FAST: 8,
@@ -89,25 +95,27 @@ const STRAT = {
   RANK_REFRESH_MS: 300000, // re-classement toutes les 5 min
 
   // --- Capital & risque ---
-  KILL_PCT: 0.35, // expulsion à -35% du capital
-  MAX_EXPOSURE_PCT: 0.35, // exposition (marge engagée) plafonnée à 35% du capital
+  KILL_PCT: 0.45, // expulsion à -45% du capital (stop bot)
+  MAX_EXPOSURE_PCT: 0.90, // exposition montée à 90% pour permettre 10-20 positions simultanées
+  MIN_POSITIONS_TARGET: 10, // objectif : au moins 10 positions possibles
+  MAX_POSITIONS_CAP: 20, // plafond dur : jamais plus de 20 positions simultanées
   FEE_PER_SIDE: 0.0004, // 0.04% taker par leg
 
   // --- Mise en % du capital (remplace BASE_STAKE fixe) ---
   STAKE_PCT: 0.045, // mise standard = 4,5% du capital
   STAKE_PCT_EXCEPTIONAL: 0.09, // mise exceptionnelle = 9% du capital
-  MAX_EXCEPTIONAL_CONCURRENT: 2, // pas plus de 2 mises 9% ouvertes en même temps
+  MAX_EXCEPTIONAL_CONCURRENT: 4, // jusqu'à 4 mises 9% simultanées (univers de 10-20 positions)
 
-  // --- Levier progressif 2x -> 7x, indexé sur le Quality score ---
-  // (fini le 12x/8x : plafond 7x, plus prudent pour le réel)
-  LEV_MAX: 7, // levier max (mise exceptionnelle ou Q>=80)
+  // --- Levier progressif x3 -> x12, indexé sur le Quality score ---
+  // Q d'entrée bas (40-50) => gros leviers réservés aux Q élevés, pas aux signaux faibles.
+  LEV_MAX: 12, // levier max (mise exceptionnelle ou Q>=80)
   LEV_BY_Q: [ // premier palier dont le seuil Q est atteint
-    { q: 80, lev: 7 },
-    { q: 75, lev: 6 },
-    { q: 70, lev: 5 },
-    { q: 65, lev: 4 },
-    { q: 60, lev: 3 },
-    { q: 0,  lev: 2 }, // Q 49-59
+    { q: 80, lev: 12 },
+    { q: 72, lev: 10 },
+    { q: 64, lev: 8 },
+    { q: 56, lev: 6 },
+    { q: 48, lev: 4 },
+    { q: 0,  lev: 3 }, // Q 40-47 (entrée la plus faible -> levier plancher x3)
   ],
 
   // --- Bonus mise exceptionnelle 9% : 2 portes ---
@@ -124,7 +132,7 @@ const STRAT = {
   // Un trade explosif échappe au TIME_EXIT_HARD et court sur son trailing.
 
   // --- Cadence & sortie temporelle intelligente ---
-  MIN_GAP_MS: 90000, // 90s minimum entre 2 entrées (même symbole)
+  MIN_GAP_MS: 840000, // 14 min minimum entre 2 entrées (même symbole)
   TIME_EXIT_FROM: 60000, // début de la fenêtre de décision de sortie (60s)
   TIME_EXIT_HARD: 150000, // sortie forcée absolue (150s = 2min30, +30s vs Serveur 2) — laisse + de temps au TP
   TIME_EXIT_GIVEBACK: 0.004, // en profit : sort si le prix retombe de 0.4% sous le pic
@@ -585,6 +593,9 @@ async function tryOpen(symbol, signal) {
 
   // Plus de limite de nombre : seul garde-fou = exposition plafonnée à 35% du capital
   const { stake, lev, isExceptional, viaRelaxed } = sizing(signal);
+  // Plafond dur du nombre de positions simultanées (10-20 demandées)
+  if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) return;
+  // Garde-fou exposition (montée à 90% pour permettre le grand nombre de positions)
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
   const qty = roundQty(symbol, (stake * lev) / S.price);
@@ -682,7 +693,7 @@ async function closePos(symbol, reason) {
   if (state.capital <= state.capitalStart * (1 - STRAT.KILL_PCT)) {
     state.running = false;
     state.killed = true;
-    logLine(`🛑 KILL SWITCH -35% — capital ${state.capital.toFixed(2)}$. Bot arrêté.`);
+    logLine(`🛑 KILL SWITCH -45% — capital ${state.capital.toFixed(2)}$. Bot arrêté.`);
     broadcast({ type: 'status', running: false });
   }
 }
@@ -883,7 +894,7 @@ function snapshot() {
     maxDrawdown: state.maxDrawdown * 100,
     exposure: currentExposure(), maxExposure: state.capital * STRAT.MAX_EXPOSURE_PCT,
     openPositions: openPositionsCount(),
-    maxPositions: Math.floor(STRAT.MAX_EXPOSURE_PCT / STRAT.STAKE_PCT),
+    maxPositions: Math.min(STRAT.MAX_POSITIONS_CAP, Math.floor(STRAT.MAX_EXPOSURE_PCT / STRAT.STAKE_PCT)),
     excOpen: exceptionalOpenCount(), excMax: STRAT.MAX_EXCEPTIONAL_CONCURRENT,
     wins: state.stats.wins, losses: state.stats.losses,
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
@@ -1041,9 +1052,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function renderStats(s){
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
-    $('run').textContent=s.killed?'KILL -35%':(s.running?'EN MARCHE':'PAUSE');
+    $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q '+(s.strat?s.strat.qMin:50)+'-'+(s.strat?s.strat.qMax:55)+' adaptatif · levier 2-7x · top 15/20';
+    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q '+(s.strat?s.strat.qMin:40)+'-'+(s.strat?s.strat.qMax:50)+' · levier 3-12x · 10-20 pos';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1145,7 +1156,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // ==================================================================
 async function start() {
   logLine(`🚀 Itachi Multi — ${MODE.toUpperCase()} — ${ALL_SYMBOLS.length} symboles — capital $${CAPITAL_START}`);
-  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q ${STRAT.Q_MIN_VOLATILE}-${STRAT.Q_MIN_CALM} adaptatif — levier 2-7x — top ${STRAT.ACTIVE_TOP_N}/${ALL_SYMBOLS.length}`);
+  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q ${STRAT.Q_MIN_VOLATILE}-${STRAT.Q_MIN_CALM} — levier 3-12x — 10-20 positions — kill -45%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
   await refreshAllKlines();
