@@ -1,23 +1,23 @@
 /* ============================================================
- *  SERVEUR 3.2 — Itachi Multi (config haute expo + sorties "laisser courir")
+ *  SERVEUR 3.3 — Itachi Multi (4 trades, fort levier, sortie net-de-frais)
  *  ------------------------------------------------------------
  *  RÉGLAGES UTILISATEUR :
- *   - 10 à 20 positions simultanées (plafond dur 20, expo 90%)
- *   - Kill switch : -45%
- *   - Q d'entrée : 40-50
- *   - Levier x3 -> x12 indexé sur Q (x12 réservé Q>=80 + mise 9%)
- *   - MTF allégé de moitié : 0.125
- *   - Délai entre 2 entrées même symbole : 14 min
+ *   - 4 trades simultanés
+ *   - Durée max d'une position : 20 min (filet ultime)
+ *   - Levier x5 -> x20 indexé sur Q (x20 réservé Q>=80)
+ *   - Q minimum d'entrée : 53
+ *   - Mise FIXE : 280$ par trade
  *
- *  SORTIES (révisées) :
- *   - Stop-loss FIXE : -1%
- *   - PAS de take-profit plafond : on laisse courir (TP infini)
- *   - Trailing armé à +0.8%, suit à -0.5% sous le pic
- *   - Fenêtre intermédiaire DÉSACTIVÉE (pas de TEMPS-PROFIT/PERTE/REBOND)
- *   - Filet ultime : sortie forcée à 14 min
- *  => Sortie uniquement par : SL -1%, trailing -0.5%, ou filet 14 min.
+ *  SORTIES :
+ *   - Stop-loss FIXE : -1% de prix
+ *   - Trailing armé quand le profit NET de frais Binance atteint +0.5%
+ *     de la mise ; il suit ensuite en valeur NETTE (-0.5% du pic de net)
+ *     et ne laisse JAMAIS le net repasser sous +0.5% (bénéfice verrouillé).
+ *   - Si le prix continue : la position reste ouverte et court.
+ *   - Filet ultime : 20 min.
  *
- *  ⚠️ Config la plus exposée. À VALIDER au /backtest avant le réel.
+ *  ⚠️ x20 : un SL -1% = -20% sur la mise (-~56$ sur 280$). Risque
+ *  maximal. Q53 = qualité moyenne admise. À VALIDER au /backtest.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -69,12 +69,14 @@ const STRAT = {
   ATR_SL_MULT: 1.0, ATR_TP_MULT: 2.0, ATR_TP_CAP: 0.018, ATR_TP_FLOOR: 0.006,
 
   // --- Trailing : armé à +0.8% (mouvement réel), suit à -0.5% sous le pic ---
-  TRAIL_START: 0.008, // le trailing s'arme dès +0.8% de profit
-  TRAIL_PCT: 0.005, // une fois armé, stop suiveur à -0.5% du pic (plus serré que le SL)
+  // --- Trailing armé sur le profit NET de frais (+0.5% net), suit à -0.5% du pic ---
+  NET_PROFIT_ARM: 0.005, // arme le trailing quand le profit NET (après frais Binance) atteint +0.5%
+  TRAIL_START: 0.008, // (inutilisé : remplacé par NET_PROFIT_ARM)
+  TRAIL_PCT: 0.005, // une fois armé, stop suiveur à -0.5% du pic
 
   // --- Sélectivité (Q adaptatif 50-55 selon volatilité du marché) ---
-  Q_MIN_CALM: 50, // marché calme : seuil haut de la zone d'entrée 40-50
-  Q_MIN_VOLATILE: 40, // marché agité : seuil bas 40 (plus d'opportunités)
+  Q_MIN_CALM: 53, // Q minimum d'entrée = 53 (fixe)
+  Q_MIN_VOLATILE: 53, // identique : seuil unique à 53
   MTF_REQUIRED: true, // alignement multi-timeframe requis...
   MTF_MIN_ALIGN: 0.125, // ...ALLÉGÉ DE MOITIÉ (0.25 -> 0.125) : laisse passer + de signaux
 
@@ -96,26 +98,27 @@ const STRAT = {
 
   // --- Capital & risque ---
   KILL_PCT: 0.45, // expulsion à -45% du capital (stop bot)
-  MAX_EXPOSURE_PCT: 0.90, // exposition montée à 90% pour permettre 10-20 positions simultanées
-  MIN_POSITIONS_TARGET: 10, // objectif : au moins 10 positions possibles
-  MAX_POSITIONS_CAP: 20, // plafond dur : jamais plus de 20 positions simultanées
+  MAX_EXPOSURE_PCT: 5.0, // plafond large : la vraie limite = 4 positions x mise fixe 280$
+  MIN_POSITIONS_TARGET: 1,
+  MAX_POSITIONS_CAP: 4, // plafond dur : 4 trades simultanés
   FEE_PER_SIDE: 0.0004, // 0.04% taker par leg
 
-  // --- Mise en % du capital (remplace BASE_STAKE fixe) ---
-  STAKE_PCT: 0.045, // mise standard = 4,5% du capital
-  STAKE_PCT_EXCEPTIONAL: 0.09, // mise exceptionnelle = 9% du capital
-  MAX_EXCEPTIONAL_CONCURRENT: 4, // jusqu'à 4 mises 9% simultanées (univers de 10-20 positions)
+  // --- Mise FIXE en $ (280$ par trade) ---
+  USE_FIXED_STAKE: true, // mise fixe en $ au lieu d'un % du capital
+  FIXED_STAKE_USD: 280, // 280$ par trade
+  STAKE_PCT: 0.045, // (inutilisé si USE_FIXED_STAKE)
+  STAKE_PCT_EXCEPTIONAL: 0.09, // (inutilisé si USE_FIXED_STAKE)
+  MAX_EXCEPTIONAL_CONCURRENT: 4,
 
-  // --- Levier progressif x3 -> x12, indexé sur le Quality score ---
-  // Q d'entrée bas (40-50) => gros leviers réservés aux Q élevés, pas aux signaux faibles.
-  LEV_MAX: 12, // levier max (mise exceptionnelle ou Q>=80)
+  // --- Levier progressif x5 -> x20, indexé sur le Quality score ---
+  // x20 réservé aux Q>=80 ; les Q faibles (53-59) reçoivent x5.
+  LEV_MAX: 20, // levier max (mise exceptionnelle ou Q>=80)
   LEV_BY_Q: [ // premier palier dont le seuil Q est atteint
-    { q: 80, lev: 12 },
-    { q: 72, lev: 10 },
-    { q: 64, lev: 8 },
-    { q: 56, lev: 6 },
-    { q: 48, lev: 4 },
-    { q: 0,  lev: 3 }, // Q 40-47 (entrée la plus faible -> levier plancher x3)
+    { q: 80, lev: 20 },
+    { q: 74, lev: 16 },
+    { q: 67, lev: 12 },
+    { q: 60, lev: 8 },
+    { q: 0,  lev: 5 }, // Q 53-59 -> levier plancher x5
   ],
 
   // --- Bonus mise exceptionnelle 9% : 2 portes ---
@@ -135,7 +138,7 @@ const STRAT = {
   MIN_GAP_MS: 840000, // 14 min minimum entre 2 entrées (même symbole)
   TIME_EXIT_INTERMEDIATE: false, // fenêtre intermédiaire DÉSACTIVÉE (pas de TEMPS-PROFIT/PERTE/REBOND)
   TIME_EXIT_FROM: 60000, // (inutilisé si TIME_EXIT_INTERMEDIATE=false)
-  TIME_EXIT_HARD: 840000, // filet ultime : sortie forcée à 14 min
+  TIME_EXIT_HARD: 1200000, // filet ultime : sortie forcée à 20 min
   TIME_EXIT_GIVEBACK: 0.004, // (inutilisé si fenêtre off)
   TIME_EXIT_WORSENING: -0.006, // (inutilisé si fenêtre off)
   TF_PRINCIPAL: '5m', // timeframe d'analyse principal
@@ -534,8 +537,10 @@ function sizing(signal) {
     viaRelaxed = false;
   }
 
-  const pct = isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT;
-  const stake = state.capital * pct;
+  // Mise : fixe en $ (280$) si activé, sinon % du capital.
+  const stake = STRAT.USE_FIXED_STAKE
+    ? STRAT.FIXED_STAKE_USD
+    : state.capital * (isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT);
   const lev = levForQuality(signal.quality, isExceptional);
 
   return { stake, lev, isExceptional, viaRelaxed };
@@ -633,8 +638,8 @@ async function tryOpen(symbol, signal) {
     slPct: exits.slPct, tpPct: exits.tpPct, exitSource: exits.source,
     sl: signal.side === 'BUY' ? entry * (1 - exits.slPct) : entry * (1 + exits.slPct),
     tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
-    peak: entry, trailing: false, openedAt: now,
-    isExplosive: false, // passe à true si TP atteint en <45s (cf. managePosition)
+    peak: entry, trailing: false, openedAt: now, netPeak: null,
+    isExplosive: false,
   };
   S.lastEntryAt = now;
   if (viaRelaxed) state.lastRelaxedExcAt = now; // limite : 1 mise 9% via 3/4 par fenêtre
@@ -716,16 +721,31 @@ function managePosition(symbol) {
   if (pos.side === 'BUY' && px < pos.trough) pos.trough = px;
   if (pos.side === 'SELL' && px > pos.trough) pos.trough = px;
 
-  if (!pos.trailing && pnlPct >= STRAT.TRAIL_START) pos.trailing = true;
+  // Profit NET de frais, exprimé en fraction de la MISE (pas du prix).
+  // net = (mouvement_prix x levier) - frais_aller_retour ; frais = 0.08% x levier.
+  const grossOnStake = pnlPct * pos.lev;
+  const feeOnStake = STRAT.FEE_PER_SIDE * 2 * pos.lev;
+  const netOnStake = grossOnStake - feeOnStake;
+
+  // Le trailing s'arme quand le profit NET atteint +0.5% de la mise (et pas avant :
+  // ainsi le gain verrouillé est toujours positif APRÈS frais Binance).
+  if (!pos.trailing && netOnStake >= STRAT.NET_PROFIT_ARM) pos.trailing = true;
 
   // Niveau SL propre à CETTE position (fixe -1% ici)
   const slPct = pos.slPct != null ? pos.slPct : STRAT.SL_PCT;
 
   // --- Sorties (priorité absolue) : SL fixe, puis trailing une fois armé ---
-  // Pas de TP plafond (NO_FIXED_TP) : le trade court tant que le trailing tient.
+  // Pas de TP plafond : le trade court tant que le trailing tient.
   if (pos.trailing) {
-    const draw = pos.side === 'BUY' ? (pos.peak - px) / pos.peak : (px - pos.peak) / pos.peak;
-    if (draw >= STRAT.TRAIL_PCT) { closePos(symbol, 'TRAILING'); return; }
+    // Le trailing suit en valeur NETTE (sur la mise), pas en prix brut — sinon à fort
+    // levier un petit recul de prix effacerait le gain. On mémorise le pic de net,
+    // et on sort si le net redescend de TRAIL_PCT sous ce pic, MAIS jamais sous +0.5% net.
+    if (pos.netPeak == null || netOnStake > pos.netPeak) pos.netPeak = netOnStake;
+    const netDraw = pos.netPeak - netOnStake; // recul du net depuis son pic
+    const floor = STRAT.NET_PROFIT_ARM; // plancher : on ne rend jamais le +0.5% net acquis
+    if (netDraw >= STRAT.TRAIL_PCT || netOnStake <= floor) {
+      closePos(symbol, 'TRAILING'); return;
+    }
   } else if (pnlPct <= -slPct) {
     closePos(symbol, 'STOP-LOSS'); return;
   }
@@ -1038,7 +1058,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q '+(s.strat?s.strat.qMin:40)+'-'+(s.strat?s.strat.qMax:50)+' · levier 3-12x · 10-20 pos';
+    $('stratline').textContent='Stratégie · SL -'+(s.strat?s.strat.sl:1)+'% · trailing net +0.5% · Q≥53 · levier 5-20x · 4 trades · 280$/trade';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1140,7 +1160,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // ==================================================================
 async function start() {
   logLine(`🚀 Itachi Multi — ${MODE.toUpperCase()} — ${ALL_SYMBOLS.length} symboles — capital $${CAPITAL_START}`);
-  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q ${STRAT.Q_MIN_VOLATILE}-${STRAT.Q_MIN_CALM} — levier 3-12x — 10-20 positions — kill -45%`);
+  logLine(`📐 SL -${STRAT.SL_PCT * 100}% — trailing armé +0.5% NET de frais, suit -${STRAT.TRAIL_PCT*100}% — Q>=${STRAT.Q_MIN_CALM} — levier 5-20x — 4 trades — ${STRAT.FIXED_STAKE_USD}$/trade — max 20min — kill -45%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
   await refreshAllKlines();
