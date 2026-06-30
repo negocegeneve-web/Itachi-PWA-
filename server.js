@@ -45,7 +45,7 @@ const STRAT = {
   TRAIL_PCT: 0.006, // -0.6% du pic une fois le trailing actif
 
   // --- Sélectivité ---
-  Q_MIN: 48, // seuil de qualité minimum (demandé)
+  Q_MIN: 55, // seuil de qualité minimum (plus sélectif)
   MTF_REQUIRED: true, // alignement multi-timeframe OBLIGATOIRE
 
   // --- Indicateurs ---
@@ -395,7 +395,7 @@ async function tryOpen(symbol, signal) {
   if (now - S.lastEntryAt < STRAT.MIN_GAP_MS) return;
   if (signal.quality < STRAT.Q_MIN) return;
 
-  if (openPositionsCount() >= maxConcurrentPositions(state.capital)) return;
+  // Plus de limite de nombre : seul garde-fou = exposition plafonnée à 35% du capital
   const { stake, lev } = sizing(signal.quality);
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
@@ -474,7 +474,8 @@ async function closePos(symbol, reason) {
   state.trades.unshift({
     symbol, side: pos.side, entry: pos.entry, exit, lev: pos.lev, quality: pos.quality,
     investi: pos.stake.toFixed(2), pnlPct: (pnlPct * 100).toFixed(2),
-    net: net.toFixed(2), fees: fees.toFixed(2), reason, durationMs: Date.now() - pos.openedAt,
+    gross: gross.toFixed(2), fees: fees.toFixed(2), net: net.toFixed(2),
+    reason, durationMs: Date.now() - pos.openedAt,
   });
   if (state.trades.length > 100) state.trades.pop();
 
@@ -652,7 +653,9 @@ function snapshot() {
     capital: state.capital, capitalStart: state.capitalStart,
     maxDrawdown: state.maxDrawdown * 100,
     exposure: currentExposure(), maxExposure: state.capital * STRAT.MAX_EXPOSURE_PCT,
-    openPositions: openPositionsCount(), maxPositions: maxConcurrentPositions(state.capital),
+    openPositions: openPositionsCount(),
+    maxPositions: Math.floor((state.capital * STRAT.MAX_EXPOSURE_PCT) / STRAT.BASE_STAKE),
+    wins: state.stats.wins, losses: state.stats.losses,
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
     trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
@@ -764,6 +767,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="card"><div class="k">P&L Net</div><div class="v" id="net">—</div></div>
     <div class="card"><div class="k">Win Rate</div><div class="v" id="wr">—</div></div>
     <div class="card"><div class="k">Trades</div><div class="v" id="ntr">0</div></div>
+    <div class="card"><div class="k">Gagnants (net)</div><div class="v green" id="wins">0</div></div>
+    <div class="card"><div class="k">Perdants (net)</div><div class="v red" id="losses">0</div></div>
     <div class="card"><div class="k">Positions</div><div class="v" id="pos">0/0</div></div>
     <div class="card"><div class="k">Exposition</div><div class="v" id="exp">—</div></div>
     <div class="card"><div class="k">Drawdown</div><div class="v" id="dd">0%</div></div>
@@ -784,7 +789,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="sec"><span class="dot"></span>Historique des trades</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Net $</th><th>Frais</th><th>Raison</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Brut</th><th>Frais Binance</th><th>Net retirable</th><th>Raison</th></tr></thead>
     <tbody id="trades"></tbody>
   </table></div>
 
@@ -804,12 +809,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -35%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q>='+(s.strat?s.strat.qMin:48)+' · 20 cryptos';
+    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q>='+(s.strat?s.strat.qMin:55)+' · 20 cryptos';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
     $('wr').className='v '+(s.winRate>=50?'green':s.winRate!=null?'red':'mut');
     $('ntr').textContent=s.stats.wins+s.stats.losses;
+    $('wins').textContent=s.stats.wins;
+    $('losses').textContent=s.stats.losses;
     $('pos').textContent=s.openPositions+'/'+s.maxPositions;
     $('exp').textContent='$'+num(s.exposure)+' / '+num(s.maxExposure);
     $('dd').textContent=(s.maxDrawdown||0).toFixed(1)+'%';
@@ -850,7 +857,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       const b=s.bias||'NEUTRE';
       const bc=b==='LONG'?'long':b==='SHORT'?'short':'flat';
       const q=s.quality!=null?s.quality:'—';
-      const qcol=s.quality>=48?'cyan':'mut';
+      const qcol=s.quality>=55?'cyan':'mut';
       const al=s.align!=null?Math.round(s.align*100)+'%':'—';
       return '<tr><td>'+s.symbol+'</td><td>'+(s.price?px(s.price):'—')+'</td>'+
         '<td>'+sparkline(s.spark)+'</td>'+
@@ -864,14 +871,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function renderTrades(list){
     const tb=$('trades');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="10" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
+    if(!list||!list.length){tb.innerHTML='<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
     tb.innerHTML=list.map(t=>{
-      const net=Number(t.net),sc=t.side==='BUY'?'long':'short',st=t.side==='BUY'?'LONG':'SHORT';
+      const net=Number(t.net),gross=Number(t.gross!=null?t.gross:net),sc=t.side==='BUY'?'long':'short',st=t.side==='BUY'?'LONG':'SHORT';
       return '<tr><td>'+t.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
         '<td>'+px(t.entry)+'</td><td>'+px(t.exit)+'</td><td>$'+num(t.investi)+'</td>'+
-        '<td class="'+cls(net)+'">'+sign(Number(t.pnlPct))+t.pnlPct+'%</td>'+
-        '<td class="'+cls(net)+'">'+sign(net)+'$'+num(net)+'</td>'+
-        '<td class="mut">$'+num(t.fees)+'</td>'+
+        '<td class="'+cls(Number(t.pnlPct))+'">'+sign(Number(t.pnlPct))+t.pnlPct+'%</td>'+
+        '<td class="'+cls(gross)+'">'+sign(gross)+'$'+num(gross)+'</td>'+
+        '<td class="mut">-$'+num(t.fees)+'</td>'+
+        '<td class="'+cls(net)+'" style="font-weight:700">'+sign(net)+'$'+num(net)+'</td>'+
         '<td class="mut">'+t.reason+'</td></tr>';
     }).join('');
   }
