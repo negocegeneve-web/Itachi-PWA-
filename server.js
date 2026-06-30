@@ -45,7 +45,8 @@ const STRAT = {
   TRAIL_PCT: 0.006, // -0.6% du pic une fois le trailing actif
 
   // --- Sélectivité ---
-  Q_MIN: 55, // seuil de qualité minimum (plus sélectif)
+  Q_MIN: 49, // seuil d'entrée minimum (entrée autorisée dès Q=49)
+  Q_ENTRY_MAX: 55, // borne haute de la zone d'entrée "modeste" (49-55)
   MTF_REQUIRED: true, // alignement multi-timeframe OBLIGATOIRE
 
   // --- Indicateurs ---
@@ -65,6 +66,7 @@ const STRAT = {
   // --- Mise en % du capital (remplace BASE_STAKE fixe) ---
   STAKE_PCT: 0.045, // mise standard = 4,5% du capital
   STAKE_PCT_EXCEPTIONAL: 0.09, // mise exceptionnelle = 9% du capital
+  MAX_EXCEPTIONAL_CONCURRENT: 2, // pas plus de 2 mises 9% ouvertes en même temps
 
   // --- Levier progressif 2x -> 7x, indexé sur le Quality score ---
   // (fini le 12x/8x : plafond 7x, plus prudent pour le réel)
@@ -75,13 +77,13 @@ const STRAT = {
     { q: 70, lev: 5 },
     { q: 65, lev: 4 },
     { q: 60, lev: 3 },
-    { q: 0,  lev: 2 }, // Q 55-59 (entrée déjà filtrée par Q_MIN=55)
+    { q: 0,  lev: 2 }, // Q 49-59
   ],
 
   // --- Bonus mise exceptionnelle 9% : 2 portes ---
   // Porte 1 : 4 conditions sur 4 réunies -> 9% à tout moment.
   // Porte 2 : si aucun setup 4/4 depuis RELAX_AFTER_MS, on accepte 3/4 -> 9%.
-  // Dans les deux cas les OBLIGATOIRES (Q>=55, MTF, expo<35%) restent requis.
+  // Dans les deux cas les OBLIGATOIRES (Q>=49, MTF, expo<35%) restent requis.
   EXC_CONDITIONS_FULL: 4, // setup parfait
   EXC_CONDITIONS_RELAXED: 3, // setup très bon, accepté après attente
   RELAX_AFTER_MS: 450000, // 7min30 (milieu de la fenêtre 6-9 min) sans 4/4 -> on assouplit
@@ -147,7 +149,7 @@ const state = {
 for (const s of ALL_SYMBOLS) {
   state.sym[s] = {
     symbol: s, price: 0, prices: [], klines: [],
-    indicators: { emaFast: null, emaSlow: null, rsi: null, momentum: null, bias: 'NEUTRE', quality: null, breakdown: null },
+    indicators: { emaFast: null, emaSlow: null, rsi: null, momentum: null, bias: 'NEUTRE', quality: null, breakdown: null, excConditions: 0 },
     mtf: { alignNorm: null, trends: {}, support: null, resistance: null },
     position: null, lastEntryAt: 0, busy: false,
   };
@@ -389,8 +391,18 @@ function levForQuality(quality, isExceptional) {
   return STRAT.LEV_BY_Q[STRAT.LEV_BY_Q.length - 1].lev;
 }
 
+// Compte les mises exceptionnelles 9% actuellement ouvertes.
+function exceptionalOpenCount() {
+  let n = 0;
+  for (const s of ALL_SYMBOLS) {
+    const pos = state.sym[s].position;
+    if (pos && pos.isExceptional) n++;
+  }
+  return n;
+}
+
 // Décide mise + levier. Renvoie aussi le flag "exceptional" pour l'affichage.
-// Les obligatoires (Q>=55, MTF, expo) sont déjà vérifiés en amont (tryOpen).
+// Les obligatoires (Q>=49, MTF, expo) sont déjà vérifiés en amont (tryOpen).
 function sizing(signal) {
   const now = Date.now();
   const cond = signal.excConditions || 0;
@@ -398,9 +410,15 @@ function sizing(signal) {
   // Porte 1 : setup parfait 4/4 -> 9% à tout moment.
   // Porte 2 : pas de 4/4 depuis RELAX_AFTER_MS -> on accepte 3/4 -> 9%.
   const relaxed = (now - state.lastFullSetupAt) >= STRAT.RELAX_AFTER_MS;
-  const isExceptional =
+  let isExceptional =
     cond >= STRAT.EXC_CONDITIONS_FULL ||
     (relaxed && cond >= STRAT.EXC_CONDITIONS_RELAXED);
+
+  // Plafond de mises exceptionnelles simultanées : au-delà, on retombe en mise standard
+  // (le bot CONTINUE d'ouvrir des positions normales 4,5% au lieu de se bloquer).
+  if (isExceptional && exceptionalOpenCount() >= STRAT.MAX_EXCEPTIONAL_CONCURRENT) {
+    isExceptional = false;
+  }
 
   const pct = isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT;
   const stake = state.capital * pct;
@@ -541,6 +559,7 @@ async function closePos(symbol, reason) {
     symbol, side: pos.side, entry: pos.entry, exit, lev: pos.lev, quality: pos.quality,
     investi: pos.stake.toFixed(2), pnlPct: (pnlPct * 100).toFixed(2),
     gross: gross.toFixed(2), fees: fees.toFixed(2), net: net.toFixed(2),
+    exceptional: !!pos.isExceptional, explosive: !!pos.isExplosive,
     reason, durationMs: Date.now() - pos.openedAt,
   });
   if (state.trades.length > 100) state.trades.pop();
@@ -704,7 +723,8 @@ function livePositions() {
     out.push({
       symbol, side: pos.side, entry: pos.entry, current: px, lev: pos.lev,
       quality: pos.quality, investi: pos.stake, sl: pos.sl, tp: pos.tp,
-      trailing: pos.trailing, pnlPct: pnlPct * 100, netLive: gross - fees,
+      trailing: pos.trailing, exceptional: !!pos.isExceptional, explosive: !!pos.isExplosive,
+      pnlPct: pnlPct * 100, netLive: gross - fees,
     });
   }
   return out;
@@ -732,6 +752,7 @@ function snapshot() {
     exposure: currentExposure(), maxExposure: state.capital * STRAT.MAX_EXPOSURE_PCT,
     openPositions: openPositionsCount(),
     maxPositions: Math.floor(STRAT.MAX_EXPOSURE_PCT / STRAT.STAKE_PCT),
+    excOpen: exceptionalOpenCount(), excMax: STRAT.MAX_EXCEPTIONAL_CONCURRENT,
     wins: state.stats.wins, losses: state.stats.losses,
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
@@ -821,6 +842,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .pill.long{background:rgba(34,229,138,.15);color:var(--green)}
   .pill.short{background:rgba(255,84,112,.15);color:var(--red)}
   .pill.flat{background:rgba(124,139,149,.15);color:var(--mut)}
+  .tag{padding:1px 6px;border-radius:5px;font-size:10px;font-weight:800;margin-left:4px}
+  .tag.exc{background:rgba(255,181,71,.18);color:var(--amber)}
+  .tag.exp{background:rgba(0,245,200,.16);color:var(--cyan)}
   .log{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:12px;
     font-family:Consolas,monospace;font-size:11px;max-height:200px;overflow:auto;color:#8aa0a0;line-height:1.7;margin-top:8px}
   .qbadge{font-weight:800}
@@ -847,6 +871,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="card"><div class="k">Gagnants (net)</div><div class="v green" id="wins">0</div></div>
     <div class="card"><div class="k">Perdants (net)</div><div class="v red" id="losses">0</div></div>
     <div class="card"><div class="k">Positions</div><div class="v" id="pos">0/0</div></div>
+    <div class="card"><div class="k">Mises 9% actives</div><div class="v cyan" id="exc">0/0</div></div>
     <div class="card"><div class="k">Exposition</div><div class="v" id="exp">—</div></div>
     <div class="card"><div class="k">Drawdown</div><div class="v" id="dd">0%</div></div>
     <div class="card"><div class="k">Frais</div><div class="v mut" id="fees">—</div></div>
@@ -886,7 +911,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -35%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q>='+(s.strat?s.strat.qMin:55)+' · 20 cryptos';
+    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q>='+(s.strat?s.strat.qMin:49)+' · levier 2-7x · 20 cryptos';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -895,6 +920,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('wins').textContent=s.stats.wins;
     $('losses').textContent=s.stats.losses;
     $('pos').textContent=s.openPositions+'/'+s.maxPositions;
+    if($('exc')) $('exc').textContent=(s.excOpen!=null?s.excOpen:0)+'/'+(s.excMax!=null?s.excMax:2);
     $('exp').textContent='$'+num(s.exposure)+' / '+num(s.maxExposure);
     $('dd').textContent=(s.maxDrawdown||0).toFixed(1)+'%';
     $('fees').textContent='$'+num(s.stats.fees);
@@ -905,7 +931,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if(!list||!list.length){tb.innerHTML='<tr><td colspan="9" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
     tb.innerHTML=list.map(p=>{
       const sc=p.side==='BUY'?'long':'short',st=p.side==='BUY'?'LONG':'SHORT';
-      return '<tr><td>'+p.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td>'+
+      const tags=(p.exceptional?'<span class="tag exc">9%💎</span>':'')+(p.explosive?'<span class="tag exp">💥</span>':'');
+      return '<tr><td>'+p.symbol+tags+'</td><td><span class="pill '+sc+'">'+st+'</span></td>'+
         '<td>'+p.lev+'x·Q'+p.quality+'</td><td>'+px(p.entry)+'</td><td>'+px(p.current)+'</td>'+
         '<td>$'+num(p.investi)+'</td><td class="red">'+px(p.sl)+'</td><td class="green">'+px(p.tp)+'</td>'+
         '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td></tr>';
@@ -934,7 +961,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       const b=s.bias||'NEUTRE';
       const bc=b==='LONG'?'long':b==='SHORT'?'short':'flat';
       const q=s.quality!=null?s.quality:'—';
-      const qcol=s.quality>=55?'cyan':'mut';
+      const qcol=s.quality>=49?'cyan':'mut';
       const al=s.align!=null?Math.round(s.align*100)+'%':'—';
       return '<tr><td>'+s.symbol+'</td><td>'+(s.price?px(s.price):'—')+'</td>'+
         '<td>'+sparkline(s.spark)+'</td>'+
@@ -951,7 +978,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if(!list||!list.length){tb.innerHTML='<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
     tb.innerHTML=list.map(t=>{
       const net=Number(t.net),gross=Number(t.gross!=null?t.gross:net),sc=t.side==='BUY'?'long':'short',st=t.side==='BUY'?'LONG':'SHORT';
-      return '<tr><td>'+t.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
+      const tags=(t.exceptional?'<span class="tag exc">9%</span>':'')+(t.explosive?'<span class="tag exp">💥</span>':'');
+      return '<tr><td>'+t.symbol+tags+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
         '<td>'+px(t.entry)+'</td><td>'+px(t.exit)+'</td><td>$'+num(t.investi)+'</td>'+
         '<td class="'+cls(Number(t.pnlPct))+'">'+sign(Number(t.pnlPct))+t.pnlPct+'%</td>'+
         '<td class="'+cls(gross)+'">'+sign(gross)+'$'+num(gross)+'</td>'+
@@ -985,7 +1013,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // ==================================================================
 async function start() {
   logLine(`🚀 Itachi Multi — ${MODE.toUpperCase()} — ${ALL_SYMBOLS.length} symboles — capital $${CAPITAL_START}`);
-  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q>=${STRAT.Q_MIN}`);
+  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q>=${STRAT.Q_MIN} — levier 2-7x`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
   await refreshAllKlines();
