@@ -60,13 +60,36 @@ const STRAT = {
   // --- Capital & risque ---
   KILL_PCT: 0.35, // expulsion à -35% du capital
   MAX_EXPOSURE_PCT: 0.35, // exposition (marge engagée) plafonnée à 35% du capital
-  BASE_STAKE: 45, // mise de départ par palier ($)
   FEE_PER_SIDE: 0.0004, // 0.04% taker par leg
 
-  // --- Levier selon qualité ---
-  LEV_LOW: 3,
-  LEV_MED: 5,
-  LEV_HIGH: 8,
+  // --- Mise en % du capital (remplace BASE_STAKE fixe) ---
+  STAKE_PCT: 0.045, // mise standard = 4,5% du capital
+  STAKE_PCT_EXCEPTIONAL: 0.09, // mise exceptionnelle = 9% du capital
+
+  // --- Levier progressif 2x -> 7x, indexé sur le Quality score ---
+  // (fini le 12x/8x : plafond 7x, plus prudent pour le réel)
+  LEV_MAX: 7, // levier max (mise exceptionnelle ou Q>=80)
+  LEV_BY_Q: [ // premier palier dont le seuil Q est atteint
+    { q: 80, lev: 7 },
+    { q: 75, lev: 6 },
+    { q: 70, lev: 5 },
+    { q: 65, lev: 4 },
+    { q: 60, lev: 3 },
+    { q: 0,  lev: 2 }, // Q 55-59 (entrée déjà filtrée par Q_MIN=55)
+  ],
+
+  // --- Bonus mise exceptionnelle 9% : 2 portes ---
+  // Porte 1 : 4 conditions sur 4 réunies -> 9% à tout moment.
+  // Porte 2 : si aucun setup 4/4 depuis RELAX_AFTER_MS, on accepte 3/4 -> 9%.
+  // Dans les deux cas les OBLIGATOIRES (Q>=55, MTF, expo<35%) restent requis.
+  EXC_CONDITIONS_FULL: 4, // setup parfait
+  EXC_CONDITIONS_RELAXED: 3, // setup très bon, accepté après attente
+  RELAX_AFTER_MS: 450000, // 7min30 (milieu de la fenêtre 6-9 min) sans 4/4 -> on assouplit
+
+  // --- Sortie "explosive" : +2,5% atteint en moins de 45s -> on laisse courir ---
+  EXPLOSIVE_PCT: 0.025, // seuil de déclenchement (= TP_PCT)
+  EXPLOSIVE_WINDOW_MS: 45000, // 45s : en deçà, le trade est marqué explosif
+  // Un trade explosif échappe au TIME_EXIT_HARD et court sur son trailing.
 
   // --- Cadence & sortie temporelle intelligente ---
   MIN_GAP_MS: 90000, // 90s minimum entre 2 entrées (même symbole)
@@ -118,6 +141,7 @@ const state = {
   trades: [],
   stats: { wins: 0, losses: 0, gross: 0, fees: 0, net: 0 },
   log: [],
+  lastFullSetupAt: 0, // horodatage du dernier setup parfait 4/4 (porte 2 du bonus 9%)
 };
 
 for (const s of ALL_SYMBOLS) {
@@ -341,15 +365,48 @@ function computeSignal(symbol) {
     ema: Math.round(emaScore), mom: Math.round(momScore),
     mtf: Math.round(mtfScore), rsi: Math.round(rsiScore), sr: Math.round(srScore),
   };
-  return { side: isLong ? 'BUY' : 'SELL', quality };
+
+  // --- Les 4 CONDITIONS du bonus mise 9% (au-dessus des obligatoires) ---
+  // Chacune est un "vrai bon point" du signal. 4/4 = setup parfait.
+  // (distinct du droit d'entrer, qui dépend lui de Q_MIN + MTF + expo)
+  let excConditions = 0;
+  if (emaScore >= 15) excConditions++; // 1. écart EMA large (tendance nette)
+  if (momScore >= 15) excConditions++; // 2. momentum fort
+  if (rsiScore >= 10) excConditions++; // 3. RSI en zone favorable
+  if (srScore >= 10) excConditions++;  // 4. position S/R favorable
+  S.indicators.excConditions = excConditions;
+
+  return { side: isLong ? 'BUY' : 'SELL', quality, excConditions };
 }
 
-function sizing(quality) {
-  let lev;
-  if (quality >= 75) lev = STRAT.LEV_HIGH;
-  else if (quality >= 60) lev = STRAT.LEV_MED;
-  else lev = STRAT.LEV_LOW;
-  return { stake: STRAT.BASE_STAKE, lev };
+// Levier progressif 2x -> 7x selon Q (premier palier atteint).
+// Mise exceptionnelle -> toujours le levier max (la conviction du timing la valide).
+function levForQuality(quality, isExceptional) {
+  if (isExceptional) return STRAT.LEV_MAX;
+  for (const tier of STRAT.LEV_BY_Q) {
+    if (quality >= tier.q) return tier.lev;
+  }
+  return STRAT.LEV_BY_Q[STRAT.LEV_BY_Q.length - 1].lev;
+}
+
+// Décide mise + levier. Renvoie aussi le flag "exceptional" pour l'affichage.
+// Les obligatoires (Q>=55, MTF, expo) sont déjà vérifiés en amont (tryOpen).
+function sizing(signal) {
+  const now = Date.now();
+  const cond = signal.excConditions || 0;
+
+  // Porte 1 : setup parfait 4/4 -> 9% à tout moment.
+  // Porte 2 : pas de 4/4 depuis RELAX_AFTER_MS -> on accepte 3/4 -> 9%.
+  const relaxed = (now - state.lastFullSetupAt) >= STRAT.RELAX_AFTER_MS;
+  const isExceptional =
+    cond >= STRAT.EXC_CONDITIONS_FULL ||
+    (relaxed && cond >= STRAT.EXC_CONDITIONS_RELAXED);
+
+  const pct = isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT;
+  const stake = state.capital * pct;
+  const lev = levForQuality(signal.quality, isExceptional);
+
+  return { stake, lev, isExceptional };
 }
 
 function currentExposure() {
@@ -395,8 +452,14 @@ async function tryOpen(symbol, signal) {
   if (now - S.lastEntryAt < STRAT.MIN_GAP_MS) return;
   if (signal.quality < STRAT.Q_MIN) return;
 
+  // Le timer de la porte 2 se réarme dès qu'un setup parfait 4/4 se présente
+  // (qu'on le trade ou non) : la porte 2 ne doit s'ouvrir QUE faute de 4/4.
+  if ((signal.excConditions || 0) >= STRAT.EXC_CONDITIONS_FULL) {
+    state.lastFullSetupAt = now;
+  }
+
   // Plus de limite de nombre : seul garde-fou = exposition plafonnée à 35% du capital
-  const { stake, lev } = sizing(signal.quality);
+  const { stake, lev, isExceptional } = sizing(signal);
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
   const qty = roundQty(symbol, (stake * lev) / S.price);
@@ -428,12 +491,15 @@ async function tryOpen(symbol, signal) {
   const entry = S.price;
   S.position = {
     side: signal.side, entry, qty, stake, lev, quality: signal.quality,
+    isExceptional, excConditions: signal.excConditions || 0,
     sl: signal.side === 'BUY' ? entry * (1 - STRAT.SL_PCT) : entry * (1 + STRAT.SL_PCT),
     tp: signal.side === 'BUY' ? entry * (1 + STRAT.TP_PCT) : entry * (1 - STRAT.TP_PCT),
     peak: entry, trailing: false, openedAt: now,
+    isExplosive: false, // passe à true si +2,5% atteint en <45s (cf. managePosition)
   };
   S.lastEntryAt = now;
-  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality}`);
+  const tag = isExceptional ? ' 💎MISE-EXC-9%' : '';
+  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality} (${signal.excConditions || 0}/4)${tag}`);
   broadcast({ type: 'positions', positions: livePositions() });
 }
 
@@ -510,6 +576,14 @@ function managePosition(symbol) {
 
   if (!pos.trailing && pnlPct >= STRAT.TRAIL_START) pos.trailing = true;
 
+  // --- Détection "explosif" : +2,5% atteint en moins de 45s ---
+  // Marquage DÉFINITIF (jamais remis à false) : même si le prix redescend
+  // ensuite sous +2,5%, le trade reste explosif et garde son exemption.
+  if (!pos.isExplosive && pnlPct >= STRAT.EXPLOSIVE_PCT && age < STRAT.EXPLOSIVE_WINDOW_MS) {
+    pos.isExplosive = true;
+    logLine(`💥 ${symbol} EXPLOSIF : +${(pnlPct * 100).toFixed(2)}% en ${(age / 1000).toFixed(1)}s — laissé courir sur trailing.`);
+  }
+
   // --- Règles classiques (priorité absolue) ---
   if (pos.trailing) {
     const draw = pos.side === 'BUY' ? (pos.peak - px) / pos.peak : (px - pos.peak) / pos.peak;
@@ -520,9 +594,12 @@ function managePosition(symbol) {
     closePos(symbol, 'TAKE-PROFIT'); return;
   }
 
+  // --- Un trade explosif échappe à toute sortie temporelle : il court sur son trailing ---
+  if (pos.isExplosive) return;
+
   // --- Sortie temporelle intelligente (au meilleur moment, pas brutale) ---
   if (age >= STRAT.TIME_EXIT_HARD) {
-    // Plafond dur : on ne traîne jamais au-delà
+    // Plafond dur : on ne traîne jamais au-delà (sauf explosif, déjà sorti ci-dessus)
     closePos(symbol, 'TEMPS-MAX');
     return;
   }
@@ -654,7 +731,7 @@ function snapshot() {
     maxDrawdown: state.maxDrawdown * 100,
     exposure: currentExposure(), maxExposure: state.capital * STRAT.MAX_EXPOSURE_PCT,
     openPositions: openPositionsCount(),
-    maxPositions: Math.floor((state.capital * STRAT.MAX_EXPOSURE_PCT) / STRAT.BASE_STAKE),
+    maxPositions: Math.floor(STRAT.MAX_EXPOSURE_PCT / STRAT.STAKE_PCT),
     wins: state.stats.wins, losses: state.stats.losses,
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
