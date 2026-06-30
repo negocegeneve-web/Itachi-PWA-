@@ -1,14 +1,14 @@
 /* ============================================================
- *  SERVEUR 2 — Itachi Multi (version améliorée)
+ *  SERVEUR 3 — Itachi Multi (correction du win rate)
  *  ------------------------------------------------------------
- *  Tout le Serveur 1 PLUS les 6 améliorations :
- *   1. Tendance allégée : MTF 0.30 -> 0.10 + filtre maitre 1h léger
- *   2. 100 bougies 1m : momentum court + ATR (volatilité)
- *   3. Séparation cadence préservée (analyse hors boucle décision)
- *   4. Top 15/20 dynamique (volatilité x force de tendance, /5min)
- *   5. Q adaptatif 50-55 (50 si volatil, 55 si calme)
- *   6. Mise 9% via 3/4 limitée à 1 par fenetre de 7-9 min
- *  => Trade davantage : À VALIDER au /backtest avant le réel.
+ *  Base = Serveur 2 + 4 corrections ciblant la cause du WR 23% :
+ *   1. TP baissé (+1.0% base) + fenêtre 120s -> 150s (+30s)
+ *   2. MTF restauré 0.10 -> 0.25 (sélectivité de tendance)
+ *   3. Trailing IMMÉDIAT dès +0.4% (capture les petits gains)
+ *   4. SL/TP ADAPTATIFS sur l'ATR (objectifs calibrés volatilité)
+ *      + garde-fou ratio SL<=TP sur actifs très volatils.
+ *  => Objectif : remplacer les sorties TEMPS-MAX à plat par des
+ *     TAKE-PROFIT et TRAILING réels. À VALIDER au /backtest.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -50,17 +50,27 @@ const KLINE_BASE = 'https://fapi.binance.com'; // bougies depuis mainnet (testne
 // PARAMÈTRES STRATÉGIE 2,5:1 (ajustables ici)
 // ==================================================================
 const STRAT = {
-  // --- Ratio risque/récompense (le cœur de la stratégie) ---
-  SL_PCT: 0.010, // -1.0% stop-loss
-  TP_PCT: 0.025, // +2.5% take-profit  => ratio 2,5:1
-  TRAIL_START: 0.015, // active le trailing après +1.5%
-  TRAIL_PCT: 0.006, // -0.6% du pic une fois le trailing actif
+  // --- Ratio risque/récompense (SL/TP de base, désormais calibrés par l'ATR) ---
+  // TP baissé : un objectif atteignable dans la fenêtre de temps courte.
+  SL_PCT: 0.006, // -0.6% stop-loss de base (plancher)
+  TP_PCT: 0.010, // +1.0% take-profit de base (au lieu de +2.5% inatteignable en 2-2.5min)
+
+  // --- SL/TP ADAPTATIFS sur l'ATR (calibrés sur la volatilité réelle de chaque actif) ---
+  USE_ATR_EXITS: true, // si true et ATR dispo : SL/TP = multiples de l'ATR (sinon SL_PCT/TP_PCT)
+  ATR_SL_MULT: 1.0, // SL = entrée -/+ 1.0 x ATR
+  ATR_TP_MULT: 2.0, // TP = entrée +/- 2.0 x ATR (ratio 2:1 calibré sur la volatilité)
+  ATR_TP_CAP: 0.018, // plafond de sécurité : le TP ATR ne dépasse jamais +1.8%
+  ATR_TP_FLOOR: 0.006, // plancher : le TP ATR n'est jamais sous +0.6%
+
+  // --- Trailing IMMÉDIAT : on protège le gain dès le premier profit ---
+  TRAIL_START: 0.004, // active le trailing dès +0.4% (au lieu de +1.5%)
+  TRAIL_PCT: 0.004, // -0.4% du pic une fois le trailing actif (capture les petits gains)
 
   // --- Sélectivité (Q adaptatif 50-55 selon volatilité du marché) ---
   Q_MIN_CALM: 55, // marché calme : on exige plus (moins de vrais signaux)
   Q_MIN_VOLATILE: 50, // marché agité : on accepte plus bas (plus d'opportunités)
   MTF_REQUIRED: true, // alignement multi-timeframe requis...
-  MTF_MIN_ALIGN: 0.10, // ...mais ALLÉGÉ : 0.10 au lieu de 0.30 (débloque les trades)
+  MTF_MIN_ALIGN: 0.25, // ...RESTAURÉ à 0.25 : on retrouve la sélectivité de tendance qui marchait
 
   // --- Indicateurs ---
   EMA_FAST: 8,
@@ -109,14 +119,14 @@ const STRAT = {
   RELAX_AFTER_MS: 450000, // 7min30 (milieu de la fenêtre 6-9 min) sans 4/4 -> on assouplit
 
   // --- Sortie "explosive" : +2,5% atteint en moins de 45s -> on laisse courir ---
-  EXPLOSIVE_PCT: 0.025, // seuil de déclenchement (= TP_PCT)
+  EXPLOSIVE_PCT: 0.025, // (héritage) le déclencheur explosif utilise désormais le TP réel de la position
   EXPLOSIVE_WINDOW_MS: 45000, // 45s : en deçà, le trade est marqué explosif
   // Un trade explosif échappe au TIME_EXIT_HARD et court sur son trailing.
 
   // --- Cadence & sortie temporelle intelligente ---
   MIN_GAP_MS: 90000, // 90s minimum entre 2 entrées (même symbole)
   TIME_EXIT_FROM: 60000, // début de la fenêtre de décision de sortie (60s)
-  TIME_EXIT_HARD: 120000, // sortie forcée absolue (120s) — on ne traîne jamais au-delà
+  TIME_EXIT_HARD: 150000, // sortie forcée absolue (150s = 2min30, +30s vs Serveur 2) — laisse + de temps au TP
   TIME_EXIT_GIVEBACK: 0.004, // en profit : sort si le prix retombe de 0.4% sous le pic
   TIME_EXIT_WORSENING: -0.006, // en perte : coupe net si la perte dépasse -0.6%
   TF_PRINCIPAL: '5m', // timeframe d'analyse principal
@@ -446,6 +456,24 @@ function qMinFor(symbol) {
   return a >= 0.004 ? STRAT.Q_MIN_VOLATILE : STRAT.Q_MIN_CALM;
 }
 
+// Calcule les niveaux SL/TP en % selon l'ATR du symbole (volatilité réelle).
+// Si l'ATR est indisponible ou USE_ATR_EXITS=false, on retombe sur SL_PCT/TP_PCT fixes.
+// Le TP ATR est borné [ATR_TP_FLOOR, ATR_TP_CAP] pour rester atteignable ET sûr.
+function computeExits(symbol) {
+  const atr = state.sym[symbol].short.atrPct;
+  if (!STRAT.USE_ATR_EXITS || atr == null || atr <= 0) {
+    return { slPct: STRAT.SL_PCT, tpPct: STRAT.TP_PCT, source: 'fixe' };
+  }
+  let slPct = atr * STRAT.ATR_SL_MULT;
+  let tpPct = atr * STRAT.ATR_TP_MULT;
+  tpPct = Math.max(STRAT.ATR_TP_FLOOR, Math.min(STRAT.ATR_TP_CAP, tpPct));
+  slPct = Math.max(STRAT.SL_PCT, slPct); // jamais un SL plus serré que le plancher
+  // Garde-fou ratio : le SL ne doit jamais dépasser le TP (sinon risque > récompense).
+  // Sur actif très volatil où le TP est plafonné, on resserre le SL à 0.7x le TP.
+  if (slPct >= tpPct) slPct = tpPct * 0.7;
+  return { slPct, tpPct, source: 'atr' };
+}
+
 // Levier progressif 2x -> 7x selon Q (premier palier atteint).
 // Mise exceptionnelle -> toujours le levier max (la conviction du timing la valide).
 function levForQuality(quality, isExceptional) {
@@ -586,17 +614,20 @@ async function tryOpen(symbol, signal) {
   }
 
   const entry = S.price;
+  const exits = computeExits(symbol); // SL/TP calibrés sur l'ATR (ou fixes en repli)
   S.position = {
     side: signal.side, entry, qty, stake, lev, quality: signal.quality,
     isExceptional, excConditions: signal.excConditions || 0,
-    sl: signal.side === 'BUY' ? entry * (1 - STRAT.SL_PCT) : entry * (1 + STRAT.SL_PCT),
-    tp: signal.side === 'BUY' ? entry * (1 + STRAT.TP_PCT) : entry * (1 - STRAT.TP_PCT),
+    slPct: exits.slPct, tpPct: exits.tpPct, exitSource: exits.source,
+    sl: signal.side === 'BUY' ? entry * (1 - exits.slPct) : entry * (1 + exits.slPct),
+    tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
     peak: entry, trailing: false, openedAt: now,
-    isExplosive: false, // passe à true si +2,5% atteint en <45s (cf. managePosition)
+    isExplosive: false, // passe à true si TP atteint en <45s (cf. managePosition)
   };
   S.lastEntryAt = now;
   if (viaRelaxed) state.lastRelaxedExcAt = now; // limite : 1 mise 9% via 3/4 par fenêtre
   const tag = isExceptional ? (viaRelaxed ? ' 💎MISE-EXC-9%(3/4)' : ' 💎MISE-EXC-9%(4/4)') : '';
+  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality} (${signal.excConditions || 0}/4) SL-${(exits.slPct*100).toFixed(2)}%/TP+${(exits.tpPct*100).toFixed(2)}%[${exits.source}]${tag}`);
   logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality} (${signal.excConditions || 0}/4)${tag}`);
   broadcast({ type: 'positions', positions: livePositions() });
 }
@@ -675,10 +706,13 @@ function managePosition(symbol) {
 
   if (!pos.trailing && pnlPct >= STRAT.TRAIL_START) pos.trailing = true;
 
-  // --- Détection "explosif" : +2,5% atteint en moins de 45s ---
-  // Marquage DÉFINITIF (jamais remis à false) : même si le prix redescend
-  // ensuite sous +2,5%, le trade reste explosif et garde son exemption.
-  if (!pos.isExplosive && pnlPct >= STRAT.EXPLOSIVE_PCT && age < STRAT.EXPLOSIVE_WINDOW_MS) {
+  // Niveaux propres à CETTE position (ATR-adaptatifs ou fixes en repli)
+  const slPct = pos.slPct != null ? pos.slPct : STRAT.SL_PCT;
+  const tpPct = pos.tpPct != null ? pos.tpPct : STRAT.TP_PCT;
+
+  // --- Détection "explosif" : TP atteint en moins de 45s -> on laisse courir ---
+  // Marquage DÉFINITIF (jamais remis à false).
+  if (!pos.isExplosive && pnlPct >= tpPct && age < STRAT.EXPLOSIVE_WINDOW_MS) {
     pos.isExplosive = true;
     logLine(`💥 ${symbol} EXPLOSIF : +${(pnlPct * 100).toFixed(2)}% en ${(age / 1000).toFixed(1)}s — laissé courir sur trailing.`);
   }
@@ -687,9 +721,9 @@ function managePosition(symbol) {
   if (pos.trailing) {
     const draw = pos.side === 'BUY' ? (pos.peak - px) / pos.peak : (px - pos.peak) / pos.peak;
     if (draw >= STRAT.TRAIL_PCT) { closePos(symbol, 'TRAILING'); return; }
-  } else if (pnlPct <= -STRAT.SL_PCT) {
+  } else if (pnlPct <= -slPct) {
     closePos(symbol, 'STOP-LOSS'); return;
-  } else if (pnlPct >= STRAT.TP_PCT) {
+  } else if (pnlPct >= tpPct) {
     closePos(symbol, 'TAKE-PROFIT'); return;
   }
 
