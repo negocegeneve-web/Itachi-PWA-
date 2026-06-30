@@ -1,3 +1,15 @@
+/* ============================================================
+ *  SERVEUR 2 — Itachi Multi (version améliorée)
+ *  ------------------------------------------------------------
+ *  Tout le Serveur 1 PLUS les 6 améliorations :
+ *   1. Tendance allégée : MTF 0.30 -> 0.10 + filtre maitre 1h léger
+ *   2. 100 bougies 1m : momentum court + ATR (volatilité)
+ *   3. Séparation cadence préservée (analyse hors boucle décision)
+ *   4. Top 15/20 dynamique (volatilité x force de tendance, /5min)
+ *   5. Q adaptatif 50-55 (50 si volatil, 55 si calme)
+ *   6. Mise 9% via 3/4 limitée à 1 par fenetre de 7-9 min
+ *  => Trade davantage : À VALIDER au /backtest avant le réel.
+ * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
  * ---------------------------------------------------------
@@ -44,10 +56,11 @@ const STRAT = {
   TRAIL_START: 0.015, // active le trailing après +1.5%
   TRAIL_PCT: 0.006, // -0.6% du pic une fois le trailing actif
 
-  // --- Sélectivité ---
-  Q_MIN: 49, // seuil d'entrée minimum (entrée autorisée dès Q=49)
-  Q_ENTRY_MAX: 55, // borne haute de la zone d'entrée "modeste" (49-55)
-  MTF_REQUIRED: true, // alignement multi-timeframe OBLIGATOIRE
+  // --- Sélectivité (Q adaptatif 50-55 selon volatilité du marché) ---
+  Q_MIN_CALM: 55, // marché calme : on exige plus (moins de vrais signaux)
+  Q_MIN_VOLATILE: 50, // marché agité : on accepte plus bas (plus d'opportunités)
+  MTF_REQUIRED: true, // alignement multi-timeframe requis...
+  MTF_MIN_ALIGN: 0.10, // ...mais ALLÉGÉ : 0.10 au lieu de 0.30 (débloque les trades)
 
   // --- Indicateurs ---
   EMA_FAST: 8,
@@ -56,7 +69,14 @@ const STRAT = {
   MOM_WINDOW: 20,
   MOM_MULT: 25000,
   EMA_MULT: 12000,
-  KLINE_LIMIT: 50, // lecture des 50 dernières bougies par symbole
+  KLINE_LIMIT: 50, // lecture des 50 dernières bougies (5m) par symbole
+  SHORT_TF: '1m', // frame la plus courte
+  SHORT_TF_LIMIT: 100, // 100 bougies 1m pour momentum court + ATR (hors boucle de décision)
+  ATR_PERIOD: 14, // ATR sur la frame courte (mesure de volatilité)
+
+  // --- Sélection dynamique : on ne trade que les N meilleurs symboles du moment ---
+  ACTIVE_TOP_N: 15, // sur les 20 surveillés, 15 actifs (par volatilité x force de tendance)
+  RANK_REFRESH_MS: 300000, // re-classement toutes les 5 min
 
   // --- Capital & risque ---
   KILL_PCT: 0.35, // expulsion à -35% du capital
@@ -144,6 +164,8 @@ const state = {
   stats: { wins: 0, losses: 0, gross: 0, fees: 0, net: 0 },
   log: [],
   lastFullSetupAt: 0, // horodatage du dernier setup parfait 4/4 (porte 2 du bonus 9%)
+  lastRelaxedExcAt: 0, // horodatage de la dernière mise 9% accordée sur un 3/4 (limite : 1 par fenêtre)
+  activeSymbols: null, // sous-ensemble des N meilleurs symboles à trader (null = tous au démarrage)
 };
 
 for (const s of ALL_SYMBOLS) {
@@ -151,6 +173,7 @@ for (const s of ALL_SYMBOLS) {
     symbol: s, price: 0, prices: [], klines: [],
     indicators: { emaFast: null, emaSlow: null, rsi: null, momentum: null, bias: 'NEUTRE', quality: null, breakdown: null, excConditions: 0 },
     mtf: { alignNorm: null, trends: {}, support: null, resistance: null },
+    short: { atrPct: null, mom: null, masterTrend: 0 }, // frame courte 1m (volatilité + momentum)
     position: null, lastEntryAt: 0, busy: false,
   };
 }
@@ -271,6 +294,19 @@ function trendFromCloses(closes) {
   if (ef == null || es == null) return 0;
   return ef > es ? 1 : ef < es ? -1 : 0;
 }
+// ATR normalisé (en % du prix) sur des bougies {high,low,close} — mesure de volatilité
+function atrPct(klines, period = 14) {
+  if (!klines || klines.length < period + 1) return null;
+  let sum = 0;
+  for (let i = klines.length - period; i < klines.length; i++) {
+    const h = klines[i].high, l = klines[i].low, pc = klines[i - 1].close;
+    const tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+    sum += tr;
+  }
+  const atr = sum / period;
+  const lastClose = klines[klines.length - 1].close;
+  return lastClose > 0 ? atr / lastClose : null;
+}
 
 // ==================================================================
 // LECTURE DES 50 DERNIÈRES BOUGIES + ANALYSE MTF PAR SYMBOLE
@@ -302,6 +338,22 @@ async function refreshKlines(symbol) {
     }
     S.mtf.trends = trends;
     S.mtf.alignNorm = totalW ? weighted / totalW : 0;
+
+    // --- Frame courte : 100 bougies 1m -> momentum court + ATR (volatilité) ---
+    // Tourne ici, dans le cycle 30s asynchrone, JAMAIS dans la boucle de décision.
+    try {
+      const short = await publicGet(KLINE_BASE, '/fapi/v1/klines', {
+        symbol, interval: STRAT.SHORT_TF, limit: STRAT.SHORT_TF_LIMIT,
+      });
+      const sk = short.map((c) => ({ high: +c[2], low: +c[3], close: +c[4] }));
+      S.short.atrPct = atrPct(sk, STRAT.ATR_PERIOD);
+      const sc = sk.map((c) => c.close);
+      if (sc.length >= 20) {
+        S.short.mom = (sc[sc.length - 1] - sc[sc.length - 20]) / sc[sc.length - 20];
+      }
+      // Tendance maître = la 1h (le TF le plus lourd), pour le filtre allégé
+      S.short.masterTrend = trends['1h'] != null ? trends['1h'] : 0;
+    } catch (e) { /* on garde l'ancien */ }
   } catch (e) { /* on garde l'ancien */ }
 }
 
@@ -332,13 +384,18 @@ function computeSignal(symbol) {
   if (!bull && !bear) { S.indicators.quality = null; return null; }
   const isLong = bull;
 
-  // Alignement MTF obligatoire
+  // Alignement MTF ALLÉGÉ (0.10 au lieu de 0.30) — débloque les trades
   const align = S.mtf.alignNorm;
   const aligned = isLong ? align : -align;
-  if (STRAT.MTF_REQUIRED && (align == null || aligned <= 0.3)) {
+  if (STRAT.MTF_REQUIRED && (align == null || aligned <= STRAT.MTF_MIN_ALIGN)) {
     S.indicators.quality = null;
     return null;
   }
+
+  // Filtre tendance maître (1h) — léger : on refuse seulement le contre-sens FRANC.
+  const master = S.short.masterTrend || 0;
+  if (isLong && master < 0 && aligned < 0.25) { S.indicators.quality = null; return null; }
+  if (!isLong && master > 0 && aligned < 0.25) { S.indicators.quality = null; return null; }
 
   const spread = Math.abs(emaFast - emaSlow) / emaSlow;
   const emaScore = Math.min(20, spread * STRAT.EMA_MULT);
@@ -381,6 +438,14 @@ function computeSignal(symbol) {
   return { side: isLong ? 'BUY' : 'SELL', quality, excConditions };
 }
 
+// Q minimum ADAPTATIF (50-55) : marché agité (ATR élevé) -> seuil bas (plus d'opportunités) ;
+// marché calme (ATR faible) -> seuil haut (on est plus exigeant).
+function qMinFor(symbol) {
+  const a = state.sym[symbol].short.atrPct;
+  if (a == null) return STRAT.Q_MIN_CALM; // par défaut, prudent
+  return a >= 0.004 ? STRAT.Q_MIN_VOLATILE : STRAT.Q_MIN_CALM;
+}
+
 // Levier progressif 2x -> 7x selon Q (premier palier atteint).
 // Mise exceptionnelle -> toujours le levier max (la conviction du timing la valide).
 function levForQuality(quality, isExceptional) {
@@ -402,29 +467,41 @@ function exceptionalOpenCount() {
 }
 
 // Décide mise + levier. Renvoie aussi le flag "exceptional" pour l'affichage.
-// Les obligatoires (Q>=49, MTF, expo) sont déjà vérifiés en amont (tryOpen).
+// Les obligatoires (Q, MTF, expo) sont déjà vérifiés en amont (tryOpen).
 function sizing(signal) {
   const now = Date.now();
   const cond = signal.excConditions || 0;
 
-  // Porte 1 : setup parfait 4/4 -> 9% à tout moment.
-  // Porte 2 : pas de 4/4 depuis RELAX_AFTER_MS -> on accepte 3/4 -> 9%.
-  const relaxed = (now - state.lastFullSetupAt) >= STRAT.RELAX_AFTER_MS;
-  let isExceptional =
-    cond >= STRAT.EXC_CONDITIONS_FULL ||
-    (relaxed && cond >= STRAT.EXC_CONDITIONS_RELAXED);
+  let isExceptional = false;
+  let viaRelaxed = false;
+
+  if (cond >= STRAT.EXC_CONDITIONS_FULL) {
+    // Porte 1 : 4 conditions sur 4 -> mise 9% À TOUT MOMENT, sans limite de fréquence.
+    isExceptional = true;
+  } else if (cond >= STRAT.EXC_CONDITIONS_RELAXED) {
+    // Porte 2 : 3 conditions. Autorisée seulement si :
+    //  (a) aucun setup 4/4 depuis RELAX_AFTER_MS (7-9 min), ET
+    //  (b) on n'a pas déjà accordé une 9%-relâchée dans cette même fenêtre.
+    const noFullSince = (now - state.lastFullSetupAt) >= STRAT.RELAX_AFTER_MS;
+    const noRelaxedSince = (now - state.lastRelaxedExcAt) >= STRAT.RELAX_AFTER_MS;
+    if (noFullSince && noRelaxedSince) {
+      isExceptional = true;
+      viaRelaxed = true;
+    }
+  }
 
   // Plafond de mises exceptionnelles simultanées : au-delà, on retombe en mise standard
   // (le bot CONTINUE d'ouvrir des positions normales 4,5% au lieu de se bloquer).
   if (isExceptional && exceptionalOpenCount() >= STRAT.MAX_EXCEPTIONAL_CONCURRENT) {
     isExceptional = false;
+    viaRelaxed = false;
   }
 
   const pct = isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT;
   const stake = state.capital * pct;
   const lev = levForQuality(signal.quality, isExceptional);
 
-  return { stake, lev, isExceptional };
+  return { stake, lev, isExceptional, viaRelaxed };
 }
 
 function currentExposure() {
@@ -467,8 +544,10 @@ async function tryOpen(symbol, signal) {
   const S = state.sym[symbol];
   const now = Date.now();
   if (S.position) return;
+  // Ne trader que les symboles actifs du moment (top-N dynamique)
+  if (state.activeSymbols && !state.activeSymbols.includes(symbol)) return;
   if (now - S.lastEntryAt < STRAT.MIN_GAP_MS) return;
-  if (signal.quality < STRAT.Q_MIN) return;
+  if (signal.quality < qMinFor(symbol)) return;
 
   // Le timer de la porte 2 se réarme dès qu'un setup parfait 4/4 se présente
   // (qu'on le trade ou non) : la porte 2 ne doit s'ouvrir QUE faute de 4/4.
@@ -477,7 +556,7 @@ async function tryOpen(symbol, signal) {
   }
 
   // Plus de limite de nombre : seul garde-fou = exposition plafonnée à 35% du capital
-  const { stake, lev, isExceptional } = sizing(signal);
+  const { stake, lev, isExceptional, viaRelaxed } = sizing(signal);
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
   const qty = roundQty(symbol, (stake * lev) / S.price);
@@ -516,7 +595,8 @@ async function tryOpen(symbol, signal) {
     isExplosive: false, // passe à true si +2,5% atteint en <45s (cf. managePosition)
   };
   S.lastEntryAt = now;
-  const tag = isExceptional ? ' 💎MISE-EXC-9%' : '';
+  if (viaRelaxed) state.lastRelaxedExcAt = now; // limite : 1 mise 9% via 3/4 par fenêtre
+  const tag = isExceptional ? (viaRelaxed ? ' 💎MISE-EXC-9%(3/4)' : ' 💎MISE-EXC-9%(4/4)') : '';
   logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality} (${signal.excConditions || 0}/4)${tag}`);
   broadcast({ type: 'positions', positions: livePositions() });
 }
@@ -697,7 +777,25 @@ async function refreshAllKlines() {
     await refreshKlines(symbol);
     await new Promise((r) => setTimeout(r, 150));
   }
+  rankActiveSymbols(); // recalcule le top-N après chaque rafraîchissement des données
   broadcast({ type: 'snapshot', data: snapshot() });
+}
+
+// Classe les 20 symboles par score = volatilité(ATR) x force d'alignement de tendance,
+// et ne garde que les ACTIVE_TOP_N meilleurs comme tradables. On concentre le capital
+// là où ça bouge ET où la tendance est nette. Les positions déjà ouvertes restent gérées.
+function rankActiveSymbols() {
+  const scored = ALL_SYMBOLS.map((s) => {
+    const S = state.sym[s];
+    const atr = S.short.atrPct || 0;
+    const align = Math.abs(S.mtf.alignNorm || 0);
+    return { s, score: atr * (0.5 + align) };
+  }).sort((a, b) => b.score - a.score);
+
+  const top = scored.slice(0, STRAT.ACTIVE_TOP_N).map((x) => x.s);
+  // On force l'inclusion des symboles déjà en position (pour continuer à les gérer)
+  for (const s of ALL_SYMBOLS) if (state.sym[s].position && !top.includes(s)) top.push(s);
+  state.activeSymbols = top;
 }
 
 // ==================================================================
@@ -757,7 +855,7 @@ function snapshot() {
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
     trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
-    strat: { sl: STRAT.SL_PCT * 100, tp: STRAT.TP_PCT * 100, qMin: STRAT.Q_MIN, ratio: STRAT.TP_PCT / STRAT.SL_PCT },
+    strat: { sl: STRAT.SL_PCT * 100, tp: STRAT.TP_PCT * 100, qMin: STRAT.Q_MIN_VOLATILE, qMax: STRAT.Q_MIN_CALM, ratio: STRAT.TP_PCT / STRAT.SL_PCT },
   };
 }
 
@@ -911,7 +1009,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -35%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q>='+(s.strat?s.strat.qMin:49)+' · levier 2-7x · 20 cryptos';
+    $('stratline').textContent='Stratégie '+(s.strat?s.strat.ratio.toFixed(1):'2.5')+':1 · SL -'+(s.strat?s.strat.sl:1)+'% / TP +'+(s.strat?s.strat.tp:2.5)+'% · Q '+(s.strat?s.strat.qMin:50)+'-'+(s.strat?s.strat.qMax:55)+' adaptatif · levier 2-7x · top 15/20';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1013,12 +1111,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // ==================================================================
 async function start() {
   logLine(`🚀 Itachi Multi — ${MODE.toUpperCase()} — ${ALL_SYMBOLS.length} symboles — capital $${CAPITAL_START}`);
-  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q>=${STRAT.Q_MIN} — levier 2-7x`);
+  logLine(`📐 Stratégie ${(STRAT.TP_PCT / STRAT.SL_PCT).toFixed(1)}:1 — SL -${STRAT.SL_PCT * 100}% / TP +${STRAT.TP_PCT * 100}% — Q ${STRAT.Q_MIN_VOLATILE}-${STRAT.Q_MIN_CALM} adaptatif — levier 2-7x — top ${STRAT.ACTIVE_TOP_N}/${ALL_SYMBOLS.length}`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
   await refreshAllKlines();
   connectPriceStreams();
   setInterval(refreshAllKlines, 30000);
+  setInterval(rankActiveSymbols, STRAT.RANK_REFRESH_MS); // re-classement top-N toutes les 5 min
   setInterval(reconcile, 9000);
   setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 3000); // mini-courbes vivantes
   server.listen(PORT, () => logLine(`🌐 Dashboard sur le port ${PORT}`));
