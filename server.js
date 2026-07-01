@@ -1,19 +1,19 @@
 /* ============================================================
- *  SERVEUR 3.8 - 1J - MAJ  (correctif démarrage)
+ *  SERVEUR 3.8 - 1J - MAJ  (correctif démarrage + WebSocket robuste)
  *  ------------------------------------------------------------
- *  CORRECTIF CLÉ : le serveur HTTP démarre EN PREMIER (server.listen
- *  avant tout appel réseau). Le dashboard s'affiche donc immédiatement
- *  et se remplit ensuite ; l'initialisation (klines des 28 symboles,
- *  scan univers, flux prix) se fait EN ARRIÈRE-PLAN, non bloquante.
- *  -> corrige le dashboard figé (l'ancien ordre attendait de charger
- *     28 symboles avant d'ouvrir le port, ce qui gelait l'affichage).
- *  Init protégée par try/catch : une panne réseau ne bloque plus
- *  le démarrage ; les boucles périodiques prennent le relais.
+ *  2 correctifs de fiabilité (stratégie inchangée) :
+ *   1. Le serveur HTTP démarre EN PREMIER (avant les appels réseau) :
+ *      le dashboard s'affiche tout de suite, l'init (klines 28 sym,
+ *      scan, flux) se fait en arrière-plan non bloquant (try/catch).
+ *   2. WebSocket dashboard avec RECONNEXION AUTOMATIQUE : si Railway
+ *      coupe une connexion WS inactive, le client se reconnecte seul
+ *      (1.5s). Envois protégés (wsSend) : un clic n'est plus perdu
+ *      si la connexion n'est pas prête. -> corrige "le bouton Lancer
+ *      ne fait rien / reste en pause".
  *
  *  Univers 28 = noyau fixe (BTC/ETH/BNB/SOL/DOGE) + 23 volatils.
  *  25 positions, rotation Q68, clôture manuelle, assoupli togglable,
  *  multi-régime (RANGE/UP/DOWN), réconciliation, chrono, scaling out.
- *  Stratégie de fond inchangée (base 3.7).
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -1310,7 +1310,24 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
 <script>
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(proto + '://' + location.host);
+  let ws = null;
+  let wsReady = false;
+  function wsSend(obj){
+    // Envoi sûr : si la connexion n'est pas prête, on ne perd pas le clic silencieusement.
+    if(ws && ws.readyState === WebSocket.OPEN){ ws.send(JSON.stringify(obj)); }
+    else { console.warn('WS pas prêt, action ignorée:', obj); }
+  }
+  function connect(){
+    ws = new WebSocket(proto + '://' + location.host);
+    ws.onopen = ()=>{ wsReady=true; console.log('WS connecté'); };
+    ws.onmessage = onWsMessage;
+    ws.onclose = ()=>{
+      wsReady=false;
+      $('run').textContent='RECONNEXION…'; $('run').className='badge off';
+      setTimeout(connect, 1500); // reconnexion automatique (Railway peut couper les WS inactifs)
+    };
+    ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
+  }
   const $ = id => document.getElementById(id);
   const num = (n,d=2) => Number(n).toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d});
   const sign = n => n>=0?'+':'';
@@ -1407,7 +1424,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   }
 
   let snap=null;
-  ws.onmessage=e=>{
+  function onWsMessage(e){
     const m=JSON.parse(e.data);
     if(m.type==='snapshot'){snap=m.data;renderStats(snap);renderPositions(snap.positions);renderSymbols(snap.symbols);renderTrades(snap.trades);$('log').innerHTML=(snap.log||[]).join('<br>');}
     else if(snap){
@@ -1417,17 +1434,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if(m.type==='trade'){snap.stats=m.stats;snap.capital=m.capital;snap.positions=m.positions;renderStats(snap);renderPositions(m.positions);}
       if(m.type==='log'){snap.log.unshift(m.line);if(snap.log.length>50)snap.log.pop();$('log').innerHTML=snap.log.join('<br>');}
     }
-  };
-  ws.onclose=()=>{$('run').textContent='DÉCONNECTÉ';$('run').className='badge off';};
+  }
   window.closePos=function(sym){
     const inp=document.getElementById('pct_'+sym);
     const pct=inp?Math.max(1,Math.min(100,Number(inp.value)||100)):100;
-    if(confirm(pct>=100?('Fermer TOUTE la position '+sym+' ?'):('Fermer '+pct+'% de '+sym+' ?'))) ws.send(JSON.stringify({action:'closeManual',symbol:sym,pct:pct}));
+    if(confirm(pct>=100?('Fermer TOUTE la position '+sym+' ?'):('Fermer '+pct+'% de '+sym+' ?'))) wsSend({action:'closeManual',symbol:sym,pct:pct});
   };
-  $('toggleRelax').onclick=()=>ws.send(JSON.stringify({action:'toggleRelax'}));
-  $('start').onclick=()=>ws.send(JSON.stringify({action:'start'}));
-  $('stop').onclick=()=>ws.send(JSON.stringify({action:'stop'}));
-  $('closeAll').onclick=()=>ws.send(JSON.stringify({action:'closeAll'}));
+  $('toggleRelax').onclick=()=>wsSend({action:'toggleRelax'});
+  $('start').onclick=()=>wsSend({action:'start'});
+  $('stop').onclick=()=>wsSend({action:'stop'});
+  $('closeAll').onclick=()=>wsSend({action:'closeAll'});
+  connect(); // établit la connexion + reconnexion auto
 </script>
 </body></html>`;
 
