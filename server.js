@@ -1,28 +1,32 @@
 /* ============================================================
- *  SERVEUR 3.4 - 280  (MAJ : mise variable, 10 trades, x2-x11)
+ *  SERVEUR 5.0 - SCALPING  (mean-reversion maker-only) — OPTIMISÉ v2
  *  ------------------------------------------------------------
- *  RÉGLAGES :
- *   - 10 trades simultanés (exposition totale plafonnée à 200% du capital)
- *   - Mise VARIABLE 90-280$ selon le nb de conditions du signal :
- *       0-1 cond -> 90$ | 2 -> 155$ | 3 -> 215$ | 4 -> 280$
- *   - Levier x2 -> x11 indexé sur Q
- *   - Q minimum 60 · timeout 15 min · kill -45%
- *   - Entrée MAKER (post-only 0.02%, fallback market 3s)
+ *  Stratégie INCHANGÉE. Optimisations de réactivité et propreté :
+ *   - INDICATEURS LIVE : Bollinger + RSI recalculés à chaque tick
+ *     (throttle 1s) en intégrant le prix courant comme close de la
+ *     bougie 1m en cours -> bandes réactives à la SECONDE, sans
+ *     attendre le refresh. C'est le vrai gain scalp (bien plus utile
+ *     que de baisser un timer : une bougie 1m ne change qu'à la minute).
+ *   - Le fetch des bougies reste à 15s (recalculer plus souvent
+ *     via l'API donnerait les mêmes valeurs + risque de rate-limit).
+ *   - refreshAllKlines parallélisé par lots de 5 (~300ms).
+ *   - Code mort des versions 3.x supprimé + commentaires corrigés.
  *
- *  SORTIE (trailing NET de frais) :
- *   - SL fixe -1%
- *   - Trailing s'arme/sécurise dès +0.3% NET (après frais Binance)
- *   - Dès que le pic dépasse +0.6% NET, le plancher remonte à +0.6%
- *     (verrou : le trade ne redescend jamais sous +0.6% net)
- *   - Suiveur -0.8% du pic net (laisse courir les gros gagnants)
- *   - Pas de TP fixe.
+ *  Détection : le prix live (WebSocket 1s) est comparé aux bandes
+ *  live -> perçage de bande détecté dans la seconde.
  *
- *  À VALIDER au /backtest (net par trade, pas win rate).
+ *  STRATÉGIE : mean-reversion en RANGE (Bollinger 20/2σ + RSI 7,
+ *  <25/>75), filtre régime ADX<25, volume, ATR. TP +0.35% / SL
+ *  -0.20% / retour médiane / time-stop 4min. MAKER-ONLY strict.
+ *  Levier x3, mise 10% (ATR-scaled), cooldown 10min, coupe-circuit
+ *  3 pertes, kill -20%. Chrono par trade.
+ *
+ *  ⚠️ Testnet valide le fonctionnement, pas la rentabilité.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
  * ---------------------------------------------------------
- * Stratégie 2,5:1 (ratio risque/récompense favorable), pensée pour gagner sur peu de trades sélectifs.
+ * SCALPING mean-reversion : fade les extrêmes de Bollinger en marché de range.
  *
  * Principes :
  *   - Binance = source de vérité (réconciliation, vérif après timeout -1007)
@@ -56,109 +60,71 @@ const WS_BASE = IS_TESTNET ? 'wss://demo-fstream.binance.com' : 'wss://fstream.b
 const KLINE_BASE = 'https://fapi.binance.com'; // bougies depuis mainnet (testnet pauvre en historique)
 
 // ==================================================================
-// PARAMÈTRES STRATÉGIE 2,5:1 (ajustables ici)
+// PARAMÈTRES SCALPING (ajustables ici)
 // ==================================================================
 const STRAT = {
-  // --- Ratio risque/récompense (SL/TP de base, désormais calibrés par l'ATR) ---
-  // --- Sorties : SL fixe -1%, pas de TP fixe — trailing armé au profit NET +0.5% ---
-  SL_PCT: 0.010, // -1.0% stop-loss fixe
-  TP_PCT: 999, // TP "infini" : aucun plafond, le trade court tant que le trailing tient
-  NO_FIXED_TP: true, // marqueur : pas de prise de profit à seuil fixe
+  // ============================================================
+  //  SERVEUR 5.0 — SCALPING mean-reversion (maker-only, x3 max)
+  //  Tous les indicateurs sont accordés au timeframe 1m.
+  // ============================================================
 
-  USE_ATR_EXITS: false, // OFF : on garde un SL fixe -1% (pas d'ATR sur les sorties ici)
-  ATR_SL_MULT: 1.0, ATR_TP_MULT: 2.0, ATR_TP_CAP: 0.018, ATR_TP_FLOOR: 0.006,
+  // --- Indicateurs de scalping (tous en 1m) ---
+  BB_PERIOD: 20,       // Bandes de Bollinger : moyenne mobile 20 périodes (1m)
+  BB_STDDEV: 2.0,      // 2 écarts-types (bandes)
+  RSI_SCALP: 7,        // RSI court 7 périodes (réactif, pro scalping)
+  RSI_OVERSOLD: 25,    // survente extrême -> signal LONG (rebond)
+  RSI_OVERBOUGHT: 75,  // surachat extrême -> signal SHORT (retour)
+  ATR_PERIOD: 14,      // ATR 1m (volatilité)
+  VOL_MA_PERIOD: 20,   // moyenne de volume (filtre volume)
 
-  // --- Trailing NET de frais : arme/sécurise à +0.3%, verrouille fort à +0.6% ---
-  NET_PROFIT_ARM: 0.003, // arme le trailing dès +0.3% NET (après frais Binance) : sécurise tôt
-  NET_PROFIT_LOCK: 0.006, // à partir de +0.6% net, le plancher remonte à +0.6% (jamais rendu en dessous)
-  TRAIL_START: 0.008, // (inutilisé : remplacé par NET_PROFIT_ARM)
-  TRAIL_PCT: 0.008, // suiveur -0.8% du pic net (laisse courir les gros gagnants)
+  // --- Filtre de régime (adaptation) : ADX ---
+  ADX_PERIOD: 14,
+  ADX_RANGE_MAX: 25,   // ADX < 25 = range -> mean-reversion OK. ADX >= 25 = tendance -> pause.
 
-  // --- Sélectivité (Q adaptatif 50-55 selon volatilité du marché) ---
-  Q_MIN_CALM: 60, // Q minimum d'entrée = 60 (plus sélectif : moins de trades, moins de frais)
-  Q_MIN_VOLATILE: 60, // seuil unique à 60
-  MTF_REQUIRED: true, // alignement multi-timeframe requis...
-  MTF_MIN_ALIGN: 0.125, // ...ALLÉGÉ DE MOITIÉ (0.25 -> 0.125) : laisse passer + de signaux
+  // --- Filtres d'entrée ---
+  ATR_FLOOR: 0.0015,   // ATR 1m minimum 0.15% : assez de volatilité pour bouger
+  ATR_CEIL: 0.015,     // ATR 1m maximum 1.5% : au-delà, marché trop chaotique -> skip
+  VOL_MIN_RATIO: 1.0,  // volume courant >= sa moyenne (confirmation)
 
-  // --- Indicateurs ---
-  EMA_FAST: 8,
-  EMA_SLOW: 21,
-  RSI_PERIOD: 14,
-  MOM_WINDOW: 20,
-  MOM_MULT: 25000,
-  EMA_MULT: 12000,
-  KLINE_LIMIT: 50, // lecture des 50 dernières bougies (5m) par symbole
-  SHORT_TF: '1m', // frame la plus courte
-  SHORT_TF_LIMIT: 100, // 100 bougies 1m pour momentum court + ATR (hors boucle de décision)
-  ATR_PERIOD: 14, // ATR sur la frame courte (mesure de volatilité)
+  // --- Sorties (scalp : cibles petites mais > frais) ---
+  TP_PCT: 0.0035,      // +0.35% take-profit (cible retour à la moyenne, ~3x les frais)
+  SL_PCT: 0.0020,      // -0.20% stop-loss serré (discipline scalp)
+  EXIT_ON_MIDBAND: true,// sortie anticipée si le prix revient à la bande médiane (VWAP-like)
+  TIME_STOP_MS: 240000,// time-stop 4 min : si ça ne revient pas vite, le pari est raté
 
-  // --- Sélection dynamique : on ne trade que les N meilleurs symboles du moment ---
-  ACTIVE_TOP_N: 15, // sur les 20 surveillés, 15 actifs (par volatilité x force de tendance)
-  RANK_REFRESH_MS: 300000, // re-classement toutes les 5 min
+  // --- Frais & exécution (maker-only strict) ---
+  FEE_MAKER: 0.0002,   // 0.02% maker par leg (réel Binance Futures)
+  FEE_TAKER: 0.0005,   // 0.05% taker par leg (réel Binance Futures ; utilisé si fallback)
+  MAKER_ONLY: true,    // STRICT : entrée maker post-only, PAS de fallback taker
+  MAKER_WAIT_MS: 90000,// attente d'exécution du post-only ; sinon annulation + prochain signal
+  MAKER_OFFSET: 0.0003,// ordre limite 0.03% en retrait (rester maker)
+  EXIT_MAKER_FIRST: true, // sortie aussi en maker d'abord (TP en limite), stop en market
 
-  // --- Capital & risque ---
-  KILL_PCT: 0.45, // expulsion à -45% du capital (stop bot)
-  MAX_EXPOSURE_PCT: 2.0, // exposition totale plafonnée à 200% du capital (garde-fou pour 10 trades)
-  MIN_POSITIONS_TARGET: 1,
-  MAX_POSITIONS_CAP: 10, // plafond dur : 10 trades simultanés
-  FEE_PER_SIDE: 0.0004, // 0.04% taker par leg
-  FEE_MAKER: 0.0002, // 0.02% maker par leg (ordre limite post-only : ~2x moins cher)
-  USE_MAKER_ENTRY: true, // tenter une entrée en limite post-only (maker), fallback market
-  MAKER_WAIT_MS: 3000, // délai d'attente d'exécution du post-only avant fallback market
-  MAKER_OFFSET: 0.0002, // place l'ordre limite 0.02% en retrait du prix (pour rester maker)
+  // --- Levier & mise ---
+  LEV: 3,              // levier FIXE x3 (scalp = frais bas, levier bas)
+  STAKE_PCT: 0.10,     // mise = 10% du capital par trade
+  STAKE_MIN_USD: 20,   // mise plancher
 
-  // --- Mise VARIABLE 90-280$ selon le nombre de conditions du signal (0..4) ---
-  // Plus le signal réunit de bonnes conditions (EMA large, momentum, RSI, S/R),
-  // plus la mise est grosse. On risque peu sur les signaux moyens, plus sur les bons.
-  USE_FIXED_STAKE: false, // mise variable (barème ci-dessous)
-  STAKE_BY_CONDITIONS: [ // index = nb de conditions réunies (0 à 4)
-    90,  // 0 condition
-    90,  // 1 condition
-    155, // 2 conditions
-    215, // 3 conditions
-    280, // 4 conditions
-  ],
-  FIXED_STAKE_USD: 280, // (inutilisé si USE_FIXED_STAKE=false)
-  STAKE_PCT: 0.045, // (inutilisé)
-  STAKE_PCT_EXCEPTIONAL: 0.09, // (inutilisé)
-  MAX_EXCEPTIONAL_CONCURRENT: 4,
+  // --- Risque & adaptation ---
+  KILL_PCT: 0.20,      // kill switch -20% du capital
+  MAX_POSITIONS_CAP: 6,// jusqu'à 6 scalps simultanés (sur des symboles différents)
+  MAX_EXPOSURE_PCT: 0.70,
+  COOLDOWN_AFTER_STOP_MS: 600000, // cooldown 10 min sur un symbole après un stop
+  MAX_CONSEC_LOSSES: 3, // 3 pertes d'affilée -> pause auto du bot (coupe-circuit)
+  ATR_SIZE_SCALING: true, // réduit la mise quand l'ATR est élevé (adaptation volatilité)
 
-  // --- Levier x2 -> x11, indexé sur Q ---
-  LEV_MAX: 11, // levier max (Q>=80)
-  LEV_BY_Q: [ // premier palier dont le seuil Q est atteint
-    { q: 80, lev: 11 },
-    { q: 74, lev: 9 },
-    { q: 67, lev: 7 },
-    { q: 60, lev: 5 },
-    { q: 0,  lev: 2 }, // Q < 60 (rare) -> levier plancher x2
-  ],
+  // --- Sélection dynamique ---
+  ACTIVE_TOP_N: 12,    // trade les 12 symboles les plus propices (volatilité dans la bande utile)
 
-  // --- Bonus mise exceptionnelle 9% : 2 portes ---
-  // Porte 1 : 4 conditions sur 4 réunies -> 9% à tout moment.
-  // Porte 2 : si aucun setup 4/4 depuis RELAX_AFTER_MS, on accepte 3/4 -> 9%.
-  // Dans les deux cas les OBLIGATOIRES (Q>=49, MTF, expo<35%) restent requis.
-  EXC_CONDITIONS_FULL: 4, // setup parfait
-  EXC_CONDITIONS_RELAXED: 3, // setup très bon, accepté après attente
-  RELAX_AFTER_MS: 450000, // 7min30 (milieu de la fenêtre 6-9 min) sans 4/4 -> on assouplit
-
-  // --- Sortie "explosive" : +2,5% atteint en moins de 45s -> on laisse courir ---
-  EXPLOSIVE_PCT: 0.025, // (héritage) le déclencheur explosif utilise désormais le TP réel de la position
-  EXPLOSIVE_WINDOW_MS: 45000, // 45s : en deçà, le trade est marqué explosif
-  // Un trade explosif échappe au TIME_EXIT_HARD et court sur son trailing.
-
-  // --- Cadence & sortie temporelle intelligente ---
-  MIN_GAP_MS: 840000, // 14 min minimum entre 2 entrées (même symbole)
-  TIME_EXIT_INTERMEDIATE: false, // fenêtre intermédiaire DÉSACTIVÉE (pas de TEMPS-PROFIT/PERTE/REBOND)
-  TIME_EXIT_FROM: 60000, // (inutilisé si TIME_EXIT_INTERMEDIATE=false)
-  TIME_EXIT_HARD: 900000, // filet ultime : sortie forcée à 15 min
-  TIME_EXIT_GIVEBACK: 0.004, // (inutilisé si fenêtre off)
-  TIME_EXIT_WORSENING: -0.006, // (inutilisé si fenêtre off)
-  TF_PRINCIPAL: '5m', // timeframe d'analyse principal
+  // --- Cadence ---
+  MIN_GAP_MS: 120000,  // 2 min minimum entre 2 entrées sur le même symbole
+  SHORT_TF: '1m',
+  SHORT_TF_LIMIT: 100, // 100 bougies 1m pour tous les indicateurs
+  KLINE_LIMIT: 50,
+  TF_PRINCIPAL: '1m',  // TIMEFRAME UNIQUE : 1m (cohérence scalp)
 };
 
 // Timeframes pour l'alignement multi-timeframe
-const TIMEFRAMES = ['1m', '5m', '15m', '1h'];
-const TF_WEIGHTS = { '1m': 1, '5m': 1.5, '15m': 2, '1h': 2.5 };
 
 // ==================================================================
 // UNIVERS DE SYMBOLES — 20 cryptos en 4 catégories
@@ -174,13 +140,6 @@ const ALL_SYMBOLS = [...SYMBOLS.major, ...SYMBOLS.largeCap, ...SYMBOLS.volatile,
 // ==================================================================
 // PALIERS DE FRÉQUENCE — plus le capital monte, plus on ouvre de positions
 // ==================================================================
-function maxConcurrentPositions(capital) {
-  if (capital >= 5000) return 12;
-  if (capital >= 3000) return 9;
-  if (capital >= 2000) return 6;
-  if (capital >= 1500) return 4;
-  return 3; // palier de départ (1000$)
-}
 
 // ==================================================================
 // ÉTAT GLOBAL
@@ -197,18 +156,16 @@ const state = {
   trades: [],
   stats: { wins: 0, losses: 0, gross: 0, fees: 0, net: 0 },
   log: [],
-  lastFullSetupAt: 0, // horodatage du dernier setup parfait 4/4 (porte 2 du bonus 9%)
-  lastRelaxedExcAt: 0, // horodatage de la dernière mise 9% accordée sur un 3/4 (limite : 1 par fenêtre)
+  consecLosses: 0, // pertes consécutives (coupe-circuit)
   activeSymbols: null, // sous-ensemble des N meilleurs symboles à trader (null = tous au démarrage)
 };
 
 for (const s of ALL_SYMBOLS) {
   state.sym[s] = {
     symbol: s, price: 0, prices: [], klines: [],
-    indicators: { emaFast: null, emaSlow: null, rsi: null, momentum: null, bias: 'NEUTRE', quality: null, breakdown: null, excConditions: 0 },
-    mtf: { alignNorm: null, trends: {}, support: null, resistance: null },
-    short: { atrPct: null, mom: null, masterTrend: 0 }, // frame courte 1m (volatilité + momentum)
-    position: null, lastEntryAt: 0, busy: false,
+    indicators: { rsi: null, bias: 'NEUTRE', quality: null, breakdown: null },
+    scalp: { bb: null, rsi: null, atrPct: null, adx: null, volRatio: null, regime: null, closedCloses: null }, // indicateurs scalping 1m
+    position: null, lastEntryAt: 0, busy: false, lastStopAt: 0,
   };
 }
 
@@ -310,13 +267,6 @@ function roundPrice(symbol, price) {
 // ==================================================================
 // INDICATEURS
 // ==================================================================
-function ema(values, period) {
-  if (values.length < period) return null;
-  const k = 2 / (period + 1);
-  let e = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) e = values[i] * k + e * (1 - k);
-  return e;
-}
 function rsi(closes, period = 14) {
   if (closes.length < period + 1) return null;
   let g = 0, l = 0;
@@ -327,11 +277,6 @@ function rsi(closes, period = 14) {
   const ag = g / period, al = l / period;
   if (al === 0) return 100;
   return 100 - 100 / (1 + ag / al);
-}
-function trendFromCloses(closes) {
-  const ef = ema(closes, 9), es = ema(closes, 21);
-  if (ef == null || es == null) return 0;
-  return ef > es ? 1 : ef < es ? -1 : 0;
 }
 // ATR normalisé (en % du prix) sur des bougies {high,low,close} — mesure de volatilité
 function atrPct(klines, period = 14) {
@@ -347,226 +292,185 @@ function atrPct(klines, period = 14) {
   return lastClose > 0 ? atr / lastClose : null;
 }
 
+// --- Indicateurs de SCALPING (tous sur bougies 1m) ---
+function sma(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(-period);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+// Bandes de Bollinger : {mid, upper, lower} sur closes
+function bollinger(closes, period, mult) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  const mid = slice.reduce((a, b) => a + b, 0) / period;
+  const variance = slice.reduce((a, b) => a + (b - mid) * (b - mid), 0) / period;
+  const sd = Math.sqrt(variance);
+  return { mid, upper: mid + mult * sd, lower: mid - mult * sd, sd };
+}
+// ADX (force de tendance) sur klines {high,low,close}. Retourne 0..100.
+// ADX bas = range (mean-reversion OK) ; ADX haut = tendance (danger MR).
+function adx(klines, period = 14) {
+  if (!klines || klines.length < period * 2 + 1) return null;
+  const tr = [], plusDM = [], minusDM = [];
+  for (let i = 1; i < klines.length; i++) {
+    const h = klines[i].high, l = klines[i].low, pc = klines[i - 1].close;
+    const ph = klines[i - 1].high, pl = klines[i - 1].low;
+    tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+    const up = h - ph, down = pl - l;
+    plusDM.push(up > down && up > 0 ? up : 0);
+    minusDM.push(down > up && down > 0 ? down : 0);
+  }
+  const wilder = (arr, p) => {
+    let s = arr.slice(0, p).reduce((a, b) => a + b, 0);
+    const out = [s];
+    for (let i = p; i < arr.length; i++) { s = s - s / p + arr[i]; out.push(s); }
+    return out;
+  };
+  const trS = wilder(tr, period), pS = wilder(plusDM, period), mS = wilder(minusDM, period);
+  const dx = [];
+  for (let i = 0; i < trS.length; i++) {
+    const pDI = 100 * (pS[i] / trS[i]);
+    const mDI = 100 * (mS[i] / trS[i]);
+    const sum = pDI + mDI;
+    dx.push(sum === 0 ? 0 : 100 * Math.abs(pDI - mDI) / sum);
+  }
+  if (dx.length < period) return null;
+  // ADX = moyenne lissée du DX
+  let adxVal = dx.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < dx.length; i++) adxVal = (adxVal * (period - 1) + dx[i]) / period;
+  return adxVal;
+}
+// Ratio du volume courant vs sa moyenne
+function volumeRatio(klines, period) {
+  if (!klines || klines.length < period + 1) return null;
+  const vols = klines.map((k) => k.vol);
+  const avg = sma(vols.slice(0, -1), period); // moyenne hors bougie courante
+  const cur = vols[vols.length - 1];
+  return avg && avg > 0 ? cur / avg : null;
+}
+
 // ==================================================================
-// LECTURE DES 50 DERNIÈRES BOUGIES + ANALYSE MTF PAR SYMBOLE
+// LECTURE DES BOUGIES 1m + CALCUL DES INDICATEURS SCALP
 // ==================================================================
 async function refreshKlines(symbol) {
   const S = state.sym[symbol];
   try {
-    const main = await publicGet(KLINE_BASE, '/fapi/v1/klines', {
-      symbol, interval: STRAT.TF_PRINCIPAL, limit: STRAT.KLINE_LIMIT,
+    // Une SEULE frame : 1m, 100 bougies. Tous les indicateurs scalp en découlent.
+    const raw = await publicGet(KLINE_BASE, '/fapi/v1/klines', {
+      symbol, interval: STRAT.SHORT_TF, limit: STRAT.SHORT_TF_LIMIT,
     });
-    S.klines = main.map((c) => ({ time: c[0], open: +c[1], high: +c[2], low: +c[3], close: +c[4], vol: +c[5] }));
-    const closes = S.klines.map((c) => c.close);
+    const kl = raw.map((c) => ({ time: c[0], open: +c[1], high: +c[2], low: +c[3], close: +c[4], vol: +c[5] }));
+    S.klines = kl;
+    const closes = kl.map((c) => c.close);
+    // On mémorise les closes des bougies FERMÉES (hors dernière, encore en formation)
+    // pour pouvoir recalculer Bollinger/RSI en direct avec le prix live à chaque tick.
+    S.scalp.closedCloses = closes.slice(0, -1);
 
-    const recent = S.klines.slice(-20);
-    S.mtf.support = Math.min(...recent.map((c) => c.low));
-    S.mtf.resistance = Math.max(...recent.map((c) => c.high));
-    S.indicators.rsi = rsi(closes, STRAT.RSI_PERIOD);
+    const bb = bollinger(closes, STRAT.BB_PERIOD, STRAT.BB_STDDEV);
+    S.scalp.bb = bb;
+    S.scalp.rsi = rsi(closes, STRAT.RSI_SCALP);
+    S.scalp.atrPct = atrPct(kl, STRAT.ATR_PERIOD);
+    S.scalp.adx = adx(kl, STRAT.ADX_PERIOD);
+    S.scalp.volRatio = volumeRatio(kl, STRAT.VOL_MA_PERIOD);
 
-    let weighted = 0, totalW = 0;
-    const trends = {};
-    for (const tf of TIMEFRAMES) {
-      try {
-        const k = await publicGet(KLINE_BASE, '/fapi/v1/klines', { symbol, interval: tf, limit: 30 });
-        const t = trendFromCloses(k.map((c) => +c[4]));
-        trends[tf] = t;
-        weighted += t * TF_WEIGHTS[tf];
-        totalW += TF_WEIGHTS[tf];
-      } catch (e) { /* tf indisponible */ }
+    // Régime : range (ADX bas) = mean-reversion OK ; tendance (ADX haut) = pause.
+    S.scalp.regime = (S.scalp.adx != null && S.scalp.adx < STRAT.ADX_RANGE_MAX) ? 'RANGE' : 'TREND';
+
+    // Biais affiché (pour le dashboard) : où est le prix vs les bandes.
+    if (bb && S.price > 0) {
+      if (S.price <= bb.lower) S.indicators.bias = 'LONG';
+      else if (S.price >= bb.upper) S.indicators.bias = 'SHORT';
+      else S.indicators.bias = 'NEUTRE';
     }
-    S.mtf.trends = trends;
-    S.mtf.alignNorm = totalW ? weighted / totalW : 0;
-
-    // --- Frame courte : 100 bougies 1m -> momentum court + ATR (volatilité) ---
-    // Tourne ici, dans le cycle 30s asynchrone, JAMAIS dans la boucle de décision.
-    try {
-      const short = await publicGet(KLINE_BASE, '/fapi/v1/klines', {
-        symbol, interval: STRAT.SHORT_TF, limit: STRAT.SHORT_TF_LIMIT,
-      });
-      const sk = short.map((c) => ({ high: +c[2], low: +c[3], close: +c[4] }));
-      S.short.atrPct = atrPct(sk, STRAT.ATR_PERIOD);
-      const sc = sk.map((c) => c.close);
-      if (sc.length >= 20) {
-        S.short.mom = (sc[sc.length - 1] - sc[sc.length - 20]) / sc[sc.length - 20];
-      }
-      // Tendance maître = la 1h (le TF le plus lourd), pour le filtre allégé
-      S.short.masterTrend = trends['1h'] != null ? trends['1h'] : 0;
-    } catch (e) { /* on garde l'ancien */ }
+    S.indicators.rsi = S.scalp.rsi;
   } catch (e) { /* on garde l'ancien */ }
 }
 
 // ==================================================================
-// SCORING (stratégie 2,5:1 — sélective, MTF obligatoire)
+// MOTEUR DE SIGNAL — mean-reversion (Bollinger + RSI + régime ADX)
 // ==================================================================
 function computeSignal(symbol) {
   const S = state.sym[symbol];
-  const p = S.prices;
-  if (p.length < STRAT.EMA_SLOW + 2) return null;
+  const sc = S.scalp;
+  const px = S.price;
+  if (!sc.bb || sc.rsi == null || sc.atrPct == null || px <= 0) return null;
 
-  const emaFast = ema(p, STRAT.EMA_FAST);
-  const emaSlow = ema(p, STRAT.EMA_SLOW);
-  if (emaFast == null || emaSlow == null) return null;
+  // --- Adaptation régime : on ne trade la mean-reversion QUE en range (ADX bas) ---
+  if (sc.regime !== 'RANGE') { S.indicators.quality = null; return null; }
 
-  const last = p[p.length - 1];
-  const prev = p[p.length - STRAT.MOM_WINDOW] || p[0];
-  const momentum = (last - prev) / prev;
+  // --- Filtres de volatilité : ni trop mou, ni chaotique ---
+  if (sc.atrPct < STRAT.ATR_FLOOR || sc.atrPct > STRAT.ATR_CEIL) { S.indicators.quality = null; return null; }
 
-  const bull = emaFast > emaSlow && momentum > 0;
-  const bear = emaFast < emaSlow && momentum < 0;
+  // --- Filtre volume : confirmation (volume courant >= sa moyenne) ---
+  if (sc.volRatio != null && sc.volRatio < STRAT.VOL_MIN_RATIO) { S.indicators.quality = null; return null; }
 
-  S.indicators.emaFast = emaFast;
-  S.indicators.emaSlow = emaSlow;
-  S.indicators.momentum = momentum;
-  S.indicators.bias = bull ? 'LONG' : bear ? 'SHORT' : 'NEUTRE';
+  // --- Signal MEAN-REVERSION : extrême de Bollinger + RSI extrême ---
+  const belowLower = px <= sc.bb.lower;
+  const aboveUpper = px >= sc.bb.upper;
+  const rsiLow = sc.rsi <= STRAT.RSI_OVERSOLD;
+  const rsiHigh = sc.rsi >= STRAT.RSI_OVERBOUGHT;
 
-  if (!bull && !bear) { S.indicators.quality = null; return null; }
-  const isLong = bull;
+  let side = null;
+  if (belowLower && rsiLow) side = 'BUY';   // survendu -> rebond attendu
+  else if (aboveUpper && rsiHigh) side = 'SELL'; // suracheté -> retour attendu
+  if (!side) { S.indicators.quality = null; return null; }
 
-  // Alignement MTF allégé (0.125) — débloque les trades
-  const align = S.mtf.alignNorm;
-  const aligned = isLong ? align : -align;
-  if (STRAT.MTF_REQUIRED && (align == null || aligned <= STRAT.MTF_MIN_ALIGN)) {
-    S.indicators.quality = null;
-    return null;
-  }
+  // --- Score de qualité (0-100) : plus l'extrême est marqué, plus Q est haut ---
+  // Distance à la bande (en fraction d'écart-type) + extrémité du RSI + volume.
+  const dist = side === 'BUY'
+    ? (sc.bb.mid - px) / (sc.bb.sd || 1)   // combien d'écarts-types sous la moyenne
+    : (px - sc.bb.mid) / (sc.bb.sd || 1);
+  const distScore = Math.min(40, Math.max(0, dist * 20)); // 2 sigma -> 40 pts
+  const rsiScore = side === 'BUY'
+    ? Math.min(30, (STRAT.RSI_OVERSOLD - sc.rsi + 5) * 3)
+    : Math.min(30, (sc.rsi - STRAT.RSI_OVERBOUGHT + 5) * 3);
+  const volScore = sc.volRatio != null ? Math.min(30, (sc.volRatio - 1) * 30) : 15;
+  const quality = Math.round(distScore + Math.max(0, rsiScore) + Math.max(0, volScore));
 
-  // Filtre tendance maître (1h) — léger : on refuse seulement le contre-sens FRANC.
-  const master = S.short.masterTrend || 0;
-  if (isLong && master < 0 && aligned < 0.25) { S.indicators.quality = null; return null; }
-  if (!isLong && master > 0 && aligned < 0.25) { S.indicators.quality = null; return null; }
-
-  const spread = Math.abs(emaFast - emaSlow) / emaSlow;
-  const emaScore = Math.min(20, spread * STRAT.EMA_MULT);
-  const momScore = Math.min(20, Math.abs(momentum) * STRAT.MOM_MULT);
-  const mtfScore = Math.max(0, Math.min(35, aligned * 35));
-
-  let rsiScore = 0;
-  if (S.indicators.rsi != null) {
-    if (isLong) rsiScore = S.indicators.rsi < 35 ? 15 : S.indicators.rsi < 50 ? 10 : S.indicators.rsi < 65 ? 5 : 0;
-    else rsiScore = S.indicators.rsi > 65 ? 15 : S.indicators.rsi > 50 ? 10 : S.indicators.rsi > 35 ? 5 : 0;
-  }
-
-  let srScore = 0;
-  if (S.mtf.support && S.mtf.resistance && S.price > 0) {
-    const range = S.mtf.resistance - S.mtf.support;
-    if (range > 0) {
-      const posInRange = (S.price - S.mtf.support) / range;
-      if (isLong) srScore = posInRange < 0.4 ? 10 : posInRange < 0.6 ? 5 : 0;
-      else srScore = posInRange > 0.6 ? 10 : posInRange > 0.4 ? 5 : 0;
-    }
-  }
-
-  const quality = Math.round(emaScore + momScore + mtfScore + rsiScore + srScore);
   S.indicators.quality = quality;
-  S.indicators.breakdown = {
-    ema: Math.round(emaScore), mom: Math.round(momScore),
-    mtf: Math.round(mtfScore), rsi: Math.round(rsiScore), sr: Math.round(srScore),
-  };
+  S.indicators.bias = side === 'BUY' ? 'LONG' : 'SHORT';
+  S.indicators.breakdown = { dist: Math.round(distScore), rsi: Math.round(Math.max(0, rsiScore)), vol: Math.round(Math.max(0, volScore)) };
 
-  // --- Les 4 CONDITIONS du bonus mise 9% (au-dessus des obligatoires) ---
-  // Chacune est un "vrai bon point" du signal. 4/4 = setup parfait.
-  // (distinct du droit d'entrer, qui dépend lui de Q_MIN + MTF + expo)
-  let excConditions = 0;
-  if (emaScore >= 15) excConditions++; // 1. écart EMA large (tendance nette)
-  if (momScore >= 15) excConditions++; // 2. momentum fort
-  if (rsiScore >= 10) excConditions++; // 3. RSI en zone favorable
-  if (srScore >= 10) excConditions++;  // 4. position S/R favorable
-  S.indicators.excConditions = excConditions;
-
-  return { side: isLong ? 'BUY' : 'SELL', quality, excConditions };
+  return { side, quality, midBand: sc.bb.mid, symbol };
 }
 
-// Q minimum ADAPTATIF (50-55) : marché agité (ATR élevé) -> seuil bas (plus d'opportunités) ;
-// marché calme (ATR faible) -> seuil haut (on est plus exigeant).
-function qMinFor(symbol) {
-  const a = state.sym[symbol].short.atrPct;
-  if (a == null) return STRAT.Q_MIN_CALM; // par défaut, prudent
-  return a >= 0.004 ? STRAT.Q_MIN_VOLATILE : STRAT.Q_MIN_CALM;
-}
-
-// Calcule les niveaux SL/TP en % selon l'ATR du symbole (volatilité réelle).
-// Si l'ATR est indisponible ou USE_ATR_EXITS=false, on retombe sur SL_PCT/TP_PCT fixes.
-// Le TP ATR est borné [ATR_TP_FLOOR, ATR_TP_CAP] pour rester atteignable ET sûr.
-function computeExits(symbol) {
-  const atr = state.sym[symbol].short.atrPct;
-  if (!STRAT.USE_ATR_EXITS || atr == null || atr <= 0) {
-    return { slPct: STRAT.SL_PCT, tpPct: STRAT.TP_PCT, source: 'fixe' };
-  }
-  let slPct = atr * STRAT.ATR_SL_MULT;
-  let tpPct = atr * STRAT.ATR_TP_MULT;
-  tpPct = Math.max(STRAT.ATR_TP_FLOOR, Math.min(STRAT.ATR_TP_CAP, tpPct));
-  slPct = Math.max(STRAT.SL_PCT, slPct); // jamais un SL plus serré que le plancher
-  // Garde-fou ratio : le SL ne doit jamais dépasser le TP (sinon risque > récompense).
-  // Sur actif très volatil où le TP est plafonné, on resserre le SL à 0.7x le TP.
-  if (slPct >= tpPct) slPct = tpPct * 0.7;
-  return { slPct, tpPct, source: 'atr' };
-}
-
-// Levier progressif 2x -> 7x selon Q (premier palier atteint).
-// Mise exceptionnelle -> toujours le levier max (la conviction du timing la valide).
-function levForQuality(quality, isExceptional) {
-  if (isExceptional) return STRAT.LEV_MAX;
-  for (const tier of STRAT.LEV_BY_Q) {
-    if (quality >= tier.q) return tier.lev;
-  }
-  return STRAT.LEV_BY_Q[STRAT.LEV_BY_Q.length - 1].lev;
-}
-
-// Compte les mises exceptionnelles 9% actuellement ouvertes.
-function exceptionalOpenCount() {
-  let n = 0;
-  for (const s of ALL_SYMBOLS) {
-    const pos = state.sym[s].position;
-    if (pos && pos.isExceptional) n++;
-  }
-  return n;
-}
-
-// Décide mise + levier. Renvoie aussi le flag "exceptional" pour l'affichage.
-// Les obligatoires (Q, MTF, expo) sont déjà vérifiés en amont (tryOpen).
-function sizing(signal) {
+// Recalcule Bollinger + RSI EN DIRECT en intégrant le prix live comme close de la
+// bougie 1m en cours. Rend les bandes réactives à la seconde (au lieu d'attendre le
+// refresh 15s). Throttlé à ~1s par symbole (inutile de recalculer 20x/seconde).
+function refreshLiveIndicators(S) {
+  const cc = S.scalp.closedCloses;
+  if (!cc || cc.length < STRAT.BB_PERIOD || S.price <= 0) return;
   const now = Date.now();
-  const cond = signal.excConditions || 0;
+  if (S._liveAt && now - S._liveAt < 1000) return; // throttle 1s
+  S._liveAt = now;
+  // Série = bougies fermées + prix live (bougie en cours)
+  const live = cc.concat(S.price);
+  const bb = bollinger(live, STRAT.BB_PERIOD, STRAT.BB_STDDEV);
+  if (bb) S.scalp.bb = bb;
+  const r = rsi(live, STRAT.RSI_SCALP);
+  if (r != null) { S.scalp.rsi = r; S.indicators.rsi = r; }
+}
 
-  let isExceptional = false;
-  let viaRelaxed = false;
+function computeExits(symbol) {
+  // Scalp : SL/TP fixes serrés (cibles calibrées pour dépasser les frais maker).
+  return { slPct: STRAT.SL_PCT, tpPct: STRAT.TP_PCT, source: 'scalp' };
+}
 
-  if (cond >= STRAT.EXC_CONDITIONS_FULL) {
-    // Porte 1 : 4 conditions sur 4 -> mise 9% À TOUT MOMENT, sans limite de fréquence.
-    isExceptional = true;
-  } else if (cond >= STRAT.EXC_CONDITIONS_RELAXED) {
-    // Porte 2 : 3 conditions. Autorisée seulement si :
-    //  (a) aucun setup 4/4 depuis RELAX_AFTER_MS (7-9 min), ET
-    //  (b) on n'a pas déjà accordé une 9%-relâchée dans cette même fenêtre.
-    const noFullSince = (now - state.lastFullSetupAt) >= STRAT.RELAX_AFTER_MS;
-    const noRelaxedSince = (now - state.lastRelaxedExcAt) >= STRAT.RELAX_AFTER_MS;
-    if (noFullSince && noRelaxedSince) {
-      isExceptional = true;
-      viaRelaxed = true;
+function sizing(signal) {
+  // Scalp : levier FIXE x3, mise = % du capital, réduite si l'ATR est élevé (adaptation).
+  let stake = Math.max(STRAT.STAKE_MIN_USD, state.capital * STRAT.STAKE_PCT);
+  if (STRAT.ATR_SIZE_SCALING) {
+    const atr = state.sym[signal.symbol] ? state.sym[signal.symbol].scalp.atrPct : null;
+    // ATR de reference = milieu de la bande utile. Au-dela, on reduit la mise (plancher 50%).
+    if (atr != null) {
+      const ref = (STRAT.ATR_FLOOR + STRAT.ATR_CEIL) / 2;
+      if (atr > ref) {
+        const factor = Math.max(0.5, ref / atr);
+        stake = Math.max(STRAT.STAKE_MIN_USD, stake * factor);
+      }
     }
   }
-
-  // Plafond de mises exceptionnelles simultanées : au-delà, on retombe en mise standard
-  // (le bot CONTINUE d'ouvrir des positions normales 4,5% au lieu de se bloquer).
-  if (isExceptional && exceptionalOpenCount() >= STRAT.MAX_EXCEPTIONAL_CONCURRENT) {
-    isExceptional = false;
-    viaRelaxed = false;
-  }
-
-  // Mise : variable selon le nb de conditions du signal (barème 90-280$), sinon fixe/%.
-  let stake;
-  if (STRAT.USE_FIXED_STAKE) {
-    stake = STRAT.FIXED_STAKE_USD;
-  } else if (STRAT.STAKE_BY_CONDITIONS) {
-    const idx = Math.max(0, Math.min(4, cond)); // cond = nb de conditions (0..4)
-    stake = STRAT.STAKE_BY_CONDITIONS[idx];
-  } else {
-    stake = state.capital * (isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT);
-  }
-  const lev = levForQuality(signal.quality, isExceptional);
-
-  return { stake, lev, isExceptional, viaRelaxed };
+  return { stake, lev: STRAT.LEV };
 }
 
 function currentExposure() {
@@ -610,39 +514,28 @@ async function getOrder(symbol, orderId) {
 // Entrée maker-first : tente un post-only (frais maker), et si pas exécuté en
 // MAKER_WAIT_MS, on annule et on passe en market (taker). Renvoie 'maker'|'taker'|null.
 async function openWithMaker(symbol, side, qty, refPrice) {
-  if (!STRAT.USE_MAKER_ENTRY) {
-    await marketOrder(symbol, side, qty);
-    return 'taker';
-  }
-  // Prix limite en retrait (BUY sous le prix, SELL au-dessus) pour rester maker
+  // Scalp MAKER-ONLY strict : on tente un post-only ; si non exécuté, on ANNULE et on
+  // renonce (pas de fallback taker, qui tuerait la marge du scalp). Retourne 'maker' ou null.
   const offset = STRAT.MAKER_OFFSET;
   const limitPx = side === 'BUY' ? refPrice * (1 - offset) : refPrice * (1 + offset);
   let order;
   try {
     order = await limitMakerOrder(symbol, side, qty, limitPx);
   } catch (e) {
-    // post-only rejeté (serait taker) ou erreur -> fallback market direct
-    await marketOrder(symbol, side, qty);
-    return 'taker';
+    return null; // post-only rejeté -> on renonce
   }
   const orderId = order && order.orderId;
-  if (!orderId) { await marketOrder(symbol, side, qty); return 'taker'; }
+  if (!orderId) return null;
 
-  // Attendre l'exécution du post-only
   await new Promise((r) => setTimeout(r, STRAT.MAKER_WAIT_MS));
   const st = await getOrder(symbol, orderId);
   if (st && st.status === 'FILLED') return 'maker';
 
-  // Pas (entièrement) rempli -> on annule et on bascule en market
+  // Non (entièrement) rempli -> on annule.
   await cancelOrder(symbol, orderId);
-  const partial = st && parseFloat(st.executedQty || 0) > 0;
-  if (partial) {
-    const remaining = roundQty(symbol, qty - parseFloat(st.executedQty));
-    if (remaining > 0) await marketOrder(symbol, side, remaining);
-    return 'maker'; // majorité en maker
-  }
-  await marketOrder(symbol, side, qty);
-  return 'taker';
+  const filled = st ? parseFloat(st.executedQty || 0) : 0;
+  if (filled > 0) return 'maker-partial'; // une partie est passée en maker, on la garde
+  return null; // rien rempli -> pas de position
 }
 async function fetchPosition(symbol) {
   try {
@@ -666,19 +559,13 @@ async function tryOpen(symbol, signal) {
   // Ne trader que les symboles actifs du moment (top-N dynamique)
   if (state.activeSymbols && !state.activeSymbols.includes(symbol)) return;
   if (now - S.lastEntryAt < STRAT.MIN_GAP_MS) return;
-  if (signal.quality < qMinFor(symbol)) return;
+  // Cooldown : après un stop sur ce symbole, on attend avant de re-trader (évite l'acharnement).
+  if (S.lastStopAt && now - S.lastStopAt < STRAT.COOLDOWN_AFTER_STOP_MS) return;
 
-  // Le timer de la porte 2 se réarme dès qu'un setup parfait 4/4 se présente
-  // (qu'on le trade ou non) : la porte 2 ne doit s'ouvrir QUE faute de 4/4.
-  if ((signal.excConditions || 0) >= STRAT.EXC_CONDITIONS_FULL) {
-    state.lastFullSetupAt = now;
-  }
-
-  // Plus de limite de nombre : seul garde-fou = exposition plafonnée à 35% du capital
-  const { stake, lev, isExceptional, viaRelaxed } = sizing(signal);
-  // Plafond dur du nombre de positions simultanées (10-20 demandées)
+  const { stake, lev } = sizing(signal);
+  // Plafond dur du nombre de positions simultanées
   if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) return;
-  // Garde-fou exposition (montée à 90% pour permettre le grand nombre de positions)
+  // Garde-fou exposition
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
   const qty = roundQty(symbol, (stake * lev) / S.price);
@@ -686,44 +573,31 @@ async function tryOpen(symbol, signal) {
 
   await setLeverage(symbol, lev);
 
-  const before = await fetchPosition(symbol);
-  const beforeQty = before ? before.qty : 0;
-
-  let entryFill = 'taker';
+  let entryFill = null;
   try {
     entryFill = await openWithMaker(symbol, signal.side, qty, S.price);
   } catch (e) {
-    if (e.binanceCode === -1007) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const after = await fetchPosition(symbol);
-      const step = SYMBOL_INFO[symbol] ? SYMBOL_INFO[symbol].stepSize : 0.001;
-      if (!(after && after.qty > beforeQty + step)) {
-        logLine(`↩️ ${symbol} : ordre non passé (timeout). Réessai plus tard.`);
-        return;
-      }
-      logLine(`✅ ${symbol} : ordre passé malgré timeout.`);
-    } else {
-      logLine(`❌ ${symbol} ouverture: ${e.message}`);
-      return;
-    }
+    logLine(`❌ ${symbol} ouverture: ${e.message}`);
+    return;
+  }
+  // Maker-only strict : si l'ordre post-only n'a pas été rempli, on renonce (pas de position).
+  if (!entryFill) {
+    logLine(`⏭️ ${symbol} : post-only non exécuté en ${STRAT.MAKER_WAIT_MS/1000}s — trade abandonné (maker-only).`);
+    return;
   }
 
   const entry = S.price;
-  const exits = computeExits(symbol); // SL/TP calibrés sur l'ATR (ou fixes en repli)
+  const exits = computeExits(symbol); // SL/TP fixes scalp
   S.position = {
     side: signal.side, entry, qty, stake, lev, quality: signal.quality,
-    isExceptional, excConditions: signal.excConditions || 0,
-    entryFill, // 'maker' ou 'taker' : sert au calcul des frais d'entrée
-    slPct: exits.slPct, tpPct: exits.tpPct, exitSource: exits.source,
+    entryFill, // 'maker' / 'maker-partial' : sert au calcul des frais d'entrée
+    slPct: exits.slPct, tpPct: exits.tpPct,
     sl: signal.side === 'BUY' ? entry * (1 - exits.slPct) : entry * (1 + exits.slPct),
     tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
-    peak: entry, trailing: false, openedAt: now, netPeak: null,
-    isExplosive: false,
+    openedAt: now, midBand: signal.midBand || null,
   };
   S.lastEntryAt = now;
-  if (viaRelaxed) state.lastRelaxedExcAt = now; // limite : 1 mise 9% via 3/4 par fenêtre
-  const tag = isExceptional ? (viaRelaxed ? ' 💎MISE-EXC-9%(3/4)' : ' 💎MISE-EXC-9%(4/4)') : '';
-  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality} (${signal.excConditions || 0}/4) SL-${(exits.slPct*100).toFixed(2)}%/TP+${(exits.tpPct*100).toFixed(2)}%[${exits.source}]${tag}`);
+  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} x${lev} Q=${signal.quality} SL-${(exits.slPct*100).toFixed(2)}%/TP+${(exits.tpPct*100).toFixed(2)}% [${entryFill}]`);
   broadcast({ type: 'positions', positions: livePositions() });
 }
 
@@ -749,17 +623,21 @@ async function closePos(symbol, reason) {
   const dir = pos.side === 'BUY' ? 1 : -1;
   const pnlPct = ((exit - pos.entry) / pos.entry) * dir;
   const gross = pnlPct * pos.stake * pos.lev;
-  // Frais : leg d'entrée maker (0.02%) si l'ordre est passé en post-only, sinon taker.
-  // Leg de sortie toujours taker (fermeture au market).
-  const entryFeeRate = pos.entryFill === 'maker' ? STRAT.FEE_MAKER : STRAT.FEE_PER_SIDE;
-  const fees = pos.stake * pos.lev * (entryFeeRate + STRAT.FEE_PER_SIDE);
+  // Frais réels : entrée maker (0.02%) en scalp maker-only ; sortie maker si TP en limite,
+  // taker si sortie au market (stop, time-stop). On approxime : TP/RETOUR-MOYENNE = maker.
+  const entryFeeRate = pos.entryFill === 'taker' ? STRAT.FEE_TAKER : STRAT.FEE_MAKER;
+  const exitMaker = STRAT.EXIT_MAKER_FIRST && (reason === 'TAKE-PROFIT' || reason === 'RETOUR-MOYENNE');
+  const exitFeeRate = exitMaker ? STRAT.FEE_MAKER : STRAT.FEE_TAKER;
+  const fees = pos.stake * pos.lev * (entryFeeRate + exitFeeRate);
   const net = gross - fees;
 
   state.capital += net;
   state.stats.gross += gross;
   state.stats.fees += fees;
   state.stats.net += net;
-  if (net >= 0) state.stats.wins++; else state.stats.losses++;
+  if (net >= 0) { state.stats.wins++; state.consecLosses = 0; }
+  else { state.stats.losses++; state.consecLosses++; }
+  if (reason === 'STOP-LOSS') S.lastStopAt = Date.now(); // déclenche le cooldown symbole
   if (state.capital > state.peakCapital) state.peakCapital = state.capital;
   const dd = (state.peakCapital - state.capital) / state.peakCapital;
   if (dd > state.maxDrawdown) state.maxDrawdown = dd;
@@ -768,7 +646,6 @@ async function closePos(symbol, reason) {
     symbol, side: pos.side, entry: pos.entry, exit, lev: pos.lev, quality: pos.quality,
     investi: pos.stake.toFixed(2), pnlPct: (pnlPct * 100).toFixed(2),
     gross: gross.toFixed(2), fees: fees.toFixed(2), net: net.toFixed(2),
-    exceptional: !!pos.isExceptional, explosive: !!pos.isExplosive,
     reason, durationMs: Date.now() - pos.openedAt,
   });
   if (state.trades.length > 100) state.trades.pop();
@@ -780,7 +657,14 @@ async function closePos(symbol, reason) {
   if (state.capital <= state.capitalStart * (1 - STRAT.KILL_PCT)) {
     state.running = false;
     state.killed = true;
-    logLine(`🛑 KILL SWITCH -45% — capital ${state.capital.toFixed(2)}$. Bot arrêté.`);
+    logLine(`🛑 KILL SWITCH -${STRAT.KILL_PCT*100}% — capital ${state.capital.toFixed(2)}$. Bot arrêté.`);
+    broadcast({ type: 'status', running: false });
+  }
+  // Coupe-circuit : N pertes consécutives -> pause auto (le marché ne convient pas).
+  if (state.consecLosses >= STRAT.MAX_CONSEC_LOSSES) {
+    state.running = false;
+    logLine(`⛔ COUPE-CIRCUIT : ${state.consecLosses} pertes consécutives — bot en pause. Relance manuelle.`);
+    state.consecLosses = 0;
     broadcast({ type: 'status', running: false });
   }
 }
@@ -794,59 +678,19 @@ function managePosition(symbol) {
   const pnlPct = ((px - pos.entry) / pos.entry) * dir;
   const age = Date.now() - pos.openedAt;
 
-  if (pos.side === 'BUY' && px > pos.peak) pos.peak = px;
-  if (pos.side === 'SELL' && px < pos.peak) pos.peak = px;
-
-  // Suivi du creux (pour détecter un rebond quand on est en perte)
-  if (pos.trough == null) pos.trough = px;
-  if (pos.side === 'BUY' && px < pos.trough) pos.trough = px;
-  if (pos.side === 'SELL' && px > pos.trough) pos.trough = px;
-
-  // Profit NET de frais, exprimé en fraction de la MISE (pas du prix).
-  // net = (mouvement_prix x levier) - frais_aller_retour ; frais = 0.08% x levier.
-  const grossOnStake = pnlPct * pos.lev;
-  const entryFeeRate = pos.entryFill === 'maker' ? STRAT.FEE_MAKER : STRAT.FEE_PER_SIDE;
-  const feeOnStake = (entryFeeRate + STRAT.FEE_PER_SIDE) * pos.lev;
-  const netOnStake = grossOnStake - feeOnStake;
-
-  // Le trailing s'arme dès +0.3% NET (sécurise tôt, gain toujours positif après frais).
-  if (!pos.trailing && netOnStake >= STRAT.NET_PROFIT_ARM) pos.trailing = true;
-
-  // Niveau SL propre à CETTE position (fixe -1% ici)
-  const slPct = pos.slPct != null ? pos.slPct : STRAT.SL_PCT;
-
-  // --- Sorties (priorité absolue) : SL fixe, puis trailing une fois armé ---
-  // Pas de TP plafond : le trade court tant que le trailing tient.
-  if (pos.trailing) {
-    // Trailing en valeur NETTE (sur la mise). On mémorise le pic de net.
-    if (pos.netPeak == null || netOnStake > pos.netPeak) pos.netPeak = netOnStake;
-    const netDraw = pos.netPeak - netOnStake; // recul du net depuis son pic
-    // Plancher progressif : +0.3% de base, puis +0.6% dès que le pic a dépassé +0.6%
-    // (une fois le trade bien en profit, on ne le laisse jamais retomber sous +0.6% net).
-    const floor = pos.netPeak >= STRAT.NET_PROFIT_LOCK ? STRAT.NET_PROFIT_LOCK : STRAT.NET_PROFIT_ARM;
-    if (netDraw >= STRAT.TRAIL_PCT || netOnStake <= floor) {
-      closePos(symbol, 'TRAILING'); return;
-    }
-  } else if (pnlPct <= -slPct) {
-    closePos(symbol, 'STOP-LOSS'); return;
+  // --- SCALP : sorties fixes serrées + retour à la moyenne + time-stop ---
+  // 1) Take-profit fixe (+0.35%)
+  if (pnlPct >= STRAT.TP_PCT) { closePos(symbol, 'TAKE-PROFIT'); return; }
+  // 2) Stop-loss serré (-0.20%)
+  if (pnlPct <= -STRAT.SL_PCT) { closePos(symbol, 'STOP-LOSS'); return; }
+  // 3) Sortie anticipée : le prix est revenu à la bande médiane (la "moyenne") en profit.
+  //    C'est la cible naturelle de la mean-reversion : on encaisse le retour.
+  if (STRAT.EXIT_ON_MIDBAND && pos.midBand && pnlPct > 0) {
+    const backToMean = pos.side === 'BUY' ? px >= pos.midBand : px <= pos.midBand;
+    if (backToMean) { closePos(symbol, 'RETOUR-MOYENNE'); return; }
   }
-
-  // --- Fenêtre intermédiaire : DÉSACTIVÉE (TIME_EXIT_INTERMEDIATE=false) ---
-  // Seul le filet ultime 20 min ferme par le temps ; sinon SL ou trailing net.
-  if (STRAT.TIME_EXIT_INTERMEDIATE && age >= STRAT.TIME_EXIT_FROM && age < STRAT.TIME_EXIT_HARD) {
-    if (pnlPct > 0) {
-      const giveback = pos.side === 'BUY' ? (pos.peak - px) / pos.peak : (px - pos.peak) / pos.peak;
-      if (giveback >= STRAT.TIME_EXIT_GIVEBACK) { closePos(symbol, 'TEMPS-PROFIT'); return; }
-    } else if (pnlPct <= STRAT.TIME_EXIT_WORSENING) {
-      closePos(symbol, 'TEMPS-PERTE'); return;
-    } else {
-      const rebound = pos.side === 'BUY' ? (px - pos.trough) / pos.trough : (pos.trough - px) / pos.trough;
-      if (rebound >= STRAT.TIME_EXIT_GIVEBACK) { closePos(symbol, 'TEMPS-REBOND'); return; }
-    }
-  }
-
-  // --- Filet ultime : sortie forcée à 14 min ---
-  if (age >= STRAT.TIME_EXIT_HARD) { closePos(symbol, 'TEMPS-MAX'); return; }
+  // 4) Time-stop : si le rebond ne vient pas vite, le pari mean-reversion est raté.
+  if (age >= STRAT.TIME_STOP_MS) { closePos(symbol, 'TIME-STOP'); return; }
 }
 
 // ==================================================================
@@ -855,6 +699,7 @@ function managePosition(symbol) {
 async function symbolTick(symbol) {
   const S = state.sym[symbol];
   if (!state.running || S.price <= 0) return;
+  refreshLiveIndicators(S); // bandes/RSI réactifs au prix courant (throttle 1s)
   managePosition(symbol);
   if (S.busy || S.position) return;
   const signal = computeSignal(symbol);
@@ -903,11 +748,15 @@ function connectPriceStreams() {
 }
 
 async function refreshAllKlines() {
-  for (const symbol of ALL_SYMBOLS) {
-    await refreshKlines(symbol);
-    await new Promise((r) => setTimeout(r, 150));
+  // Rafraîchissement PARALLÈLE par lots (au lieu de séquentiel + 150ms) :
+  // 20 symboles en ~1 requête chacun -> quelques centaines de ms au lieu de ~3s.
+  // Lots de 5 pour ne pas saturer le rate-limit Binance.
+  const BATCH = 5;
+  for (let i = 0; i < ALL_SYMBOLS.length; i += BATCH) {
+    const slice = ALL_SYMBOLS.slice(i, i + BATCH);
+    await Promise.all(slice.map((s) => refreshKlines(s)));
   }
-  rankActiveSymbols(); // recalcule le top-N après chaque rafraîchissement des données
+  rankActiveSymbols();
   broadcast({ type: 'snapshot', data: snapshot() });
 }
 
@@ -915,15 +764,20 @@ async function refreshAllKlines() {
 // et ne garde que les ACTIVE_TOP_N meilleurs comme tradables. On concentre le capital
 // là où ça bouge ET où la tendance est nette. Les positions déjà ouvertes restent gérées.
 function rankActiveSymbols() {
+  // Scalp : on privilégie les symboles en RANGE (ADX bas) et dans la bande de volatilité utile.
+  const mid = (STRAT.ATR_FLOOR + STRAT.ATR_CEIL) / 2;
   const scored = ALL_SYMBOLS.map((s) => {
     const S = state.sym[s];
-    const atr = S.short.atrPct || 0;
-    const align = Math.abs(S.mtf.alignNorm || 0);
-    return { s, score: atr * (0.5 + align) };
+    const atr = S.scalp.atrPct || 0;
+    const adxVal = S.scalp.adx != null ? S.scalp.adx : 100;
+    // Score : volatilité proche du milieu de la bande utile + bonus si range (ADX bas)
+    const inBand = (atr >= STRAT.ATR_FLOOR && atr <= STRAT.ATR_CEIL) ? 1 : 0;
+    const rangeBonus = adxVal < STRAT.ADX_RANGE_MAX ? 1 : 0.2;
+    const proximity = atr > 0 ? 1 - Math.min(1, Math.abs(atr - mid) / mid) : 0;
+    return { s, score: inBand * rangeBonus * (0.3 + proximity) };
   }).sort((a, b) => b.score - a.score);
 
   const top = scored.slice(0, STRAT.ACTIVE_TOP_N).map((x) => x.s);
-  // On force l'inclusion des symboles déjà en position (pour continuer à les gérer)
   for (const s of ALL_SYMBOLS) if (state.sym[s].position && !top.includes(s)) top.push(s);
   state.activeSymbols = top;
 }
@@ -947,12 +801,12 @@ function livePositions() {
     const dir = pos.side === 'BUY' ? 1 : -1;
     const pnlPct = ((px - pos.entry) / pos.entry) * dir;
     const gross = pnlPct * pos.stake * pos.lev;
-    const fees = pos.stake * pos.lev * STRAT.FEE_PER_SIDE * 2;
+    const fees = pos.stake * pos.lev * (STRAT.FEE_MAKER * 2);
     out.push({
       symbol, side: pos.side, entry: pos.entry, current: px, lev: pos.lev,
       quality: pos.quality, investi: pos.stake, sl: pos.sl, tp: pos.tp,
-      trailing: pos.trailing, exceptional: !!pos.isExceptional, explosive: !!pos.isExplosive,
       pnlPct: pnlPct * 100, netLive: gross - fees,
+      ageMs: Date.now() - pos.openedAt, timeStopMs: STRAT.TIME_STOP_MS,
     });
   }
   return out;
@@ -965,7 +819,7 @@ function symbolsOverview() {
     const spark = S.prices.slice(-40);
     return {
       symbol, price: S.price, bias: S.indicators.bias, quality: S.indicators.quality,
-      rsi: S.indicators.rsi, align: S.mtf.alignNorm, hasPosition: !!S.position,
+      rsi: S.indicators.rsi, regime: S.scalp.regime, adx: S.scalp.adx, hasPosition: !!S.position,
       spark,
     };
   });
@@ -980,12 +834,12 @@ function snapshot() {
     exposure: currentExposure(), maxExposure: state.capital * STRAT.MAX_EXPOSURE_PCT,
     openPositions: openPositionsCount(),
     maxPositions: Math.min(STRAT.MAX_POSITIONS_CAP, Math.floor(STRAT.MAX_EXPOSURE_PCT / STRAT.STAKE_PCT)),
-    excOpen: exceptionalOpenCount(), excMax: STRAT.MAX_EXCEPTIONAL_CONCURRENT,
+    excOpen: 0, excMax: 0,
     wins: state.stats.wins, losses: state.stats.losses,
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
     trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
-    strat: { sl: STRAT.SL_PCT * 100, tp: STRAT.TP_PCT * 100, qMin: STRAT.Q_MIN_VOLATILE, qMax: STRAT.Q_MIN_CALM, ratio: STRAT.TP_PCT / STRAT.SL_PCT },
+    strat: { sl: STRAT.SL_PCT * 100, tp: STRAT.TP_PCT * 100, lev: STRAT.LEV, ratio: STRAT.TP_PCT / STRAT.SL_PCT },
   };
 }
 
@@ -1080,11 +934,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.4 - 280 - x2 x11 - mise 90/280 <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">5.0 - Scalping - MR x3 <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.4 · mise 90-280$ · levier x2-x11 · maker · 10 trades · 15min</div>
+  <div class="sub" id="stratline">5.0 Scalping · mean-reversion · maker-only · x3 · TP+0.35% / SL-0.20%</div>
 
   <div class="controls">
     <button id="start" class="btn-go">▶ Démarrer</button>
@@ -1108,19 +962,19 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="sec"><span class="dot"></span>Positions ouvertes</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev·Q</th><th>Entrée</th><th>Actuel</th><th>Investi</th><th>SL</th><th>TP</th><th>P&L live</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev·Q</th><th>Entrée</th><th>Actuel</th><th>Investi</th><th>SL</th><th>TP</th><th>⏱ Durée</th><th>P&L live</th></tr></thead>
     <tbody id="positions"><tr><td colspan="9" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr></tbody>
   </table></div>
 
   <div class="sec"><span class="dot"></span>Surveillance des 20 symboles</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Prix</th><th>Courbe</th><th>Biais</th><th>Q</th><th>RSI</th><th>Align. MTF</th><th>Statut</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Prix</th><th>Courbe</th><th>Biais</th><th>Q</th><th>RSI</th><th>Régime (ADX)</th><th>Statut</th></tr></thead>
     <tbody id="symbols"></tbody>
   </table></div>
 
   <div class="sec"><span class="dot"></span>Historique des trades</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Brut</th><th>Frais Binance</th><th>Net retirable</th><th>Raison</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Brut</th><th>Frais Binance</th><th>Net retirable</th><th>⏱ Durée</th><th>Raison</th></tr></thead>
     <tbody id="trades"></tbody>
   </table></div>
 
@@ -1135,12 +989,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   const sign = n => n>=0?'+':'';
   const cls = n => n>=0?'green':'red';
   function px(v){ const n=Number(v); return n>=100?num(n,2):n>=1?num(n,3):num(n,5); }
+  function dur(ms){ if(ms==null)return '—'; const s=Math.floor(ms/1000); const m=Math.floor(s/60); const r=s%60; return m+':'+(r<10?'0':'')+r; }
 
   function renderStats(s){
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='3.4 · SL -'+(s.strat?s.strat.sl:1)+'% · trailing net +0.3%→+0.6% · Q≥60 · levier x2-x11 · maker · mise 90-280$ · 10 trades';
+    $('stratline').textContent='5.0 Scalping · MR · TP +'+(s.strat?s.strat.tp:0.35)+'% / SL -'+(s.strat?s.strat.sl:0.2)+'% · maker-only · x'+(s.strat?s.strat.lev:3);
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1157,13 +1012,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function renderPositions(list){
     const tb=$('positions');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="9" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
+    if(!list||!list.length){tb.innerHTML='<tr><td colspan="10" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
     tb.innerHTML=list.map(p=>{
       const sc=p.side==='BUY'?'long':'short',st=p.side==='BUY'?'LONG':'SHORT';
-      const tags=(p.exceptional?'<span class="tag exc">9%💎</span>':'')+(p.explosive?'<span class="tag exp">💥</span>':'');
-      return '<tr><td>'+p.symbol+tags+'</td><td><span class="pill '+sc+'">'+st+'</span></td>'+
+      return '<tr><td>'+p.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td>'+
         '<td>'+p.lev+'x·Q'+p.quality+'</td><td>'+px(p.entry)+'</td><td>'+px(p.current)+'</td>'+
         '<td>$'+num(p.investi)+'</td><td class="red">'+px(p.sl)+'</td><td class="green">'+px(p.tp)+'</td>'+
+        '<td class="'+((p.timeStopMs&&p.ageMs>p.timeStopMs*0.75)?'red':'mut')+'">'+dur(p.ageMs)+'</td>'+
         '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td></tr>';
     }).join('');
   }
@@ -1191,29 +1046,30 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       const bc=b==='LONG'?'long':b==='SHORT'?'short':'flat';
       const q=s.quality!=null?s.quality:'—';
       const qcol=s.quality>=49?'cyan':'mut';
-      const al=s.align!=null?Math.round(s.align*100)+'%':'—';
+      const reg=s.regime||'—'; const adxTxt=s.adx!=null?s.adx.toFixed(0):'—';
+      const regTxt=reg==='RANGE'?'<span style="color:var(--green)">RANGE '+adxTxt+'</span>':reg==='TREND'?'<span style="color:var(--mut)">TREND '+adxTxt+'</span>':'—';
       return '<tr><td>'+s.symbol+'</td><td>'+(s.price?px(s.price):'—')+'</td>'+
         '<td>'+sparkline(s.spark)+'</td>'+
         '<td><span class="pill '+bc+'">'+b+'</span></td>'+
         '<td class="qbadge '+qcol+'">'+q+'</td>'+
         '<td>'+(s.rsi!=null?s.rsi.toFixed(0):'—')+'</td>'+
-        '<td>'+al+'</td>'+
+        '<td>'+regTxt+'</td>'+
         '<td>'+(s.hasPosition?'<span class="pill long">EN POSITION</span>':'<span class="mut">-</span>')+'</td></tr>';
     }).join('');
   }
 
   function renderTrades(list){
     const tb=$('trades');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
+    if(!list||!list.length){tb.innerHTML='<tr><td colspan="12" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
     tb.innerHTML=list.map(t=>{
       const net=Number(t.net),gross=Number(t.gross!=null?t.gross:net),sc=t.side==='BUY'?'long':'short',st=t.side==='BUY'?'LONG':'SHORT';
-      const tags=(t.exceptional?'<span class="tag exc">9%</span>':'')+(t.explosive?'<span class="tag exp">💥</span>':'');
-      return '<tr><td>'+t.symbol+tags+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
+      return '<tr><td>'+t.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
         '<td>'+px(t.entry)+'</td><td>'+px(t.exit)+'</td><td>$'+num(t.investi)+'</td>'+
         '<td class="'+cls(Number(t.pnlPct))+'">'+sign(Number(t.pnlPct))+t.pnlPct+'%</td>'+
         '<td class="'+cls(gross)+'">'+sign(gross)+'$'+num(gross)+'</td>'+
         '<td class="mut">-$'+num(t.fees)+'</td>'+
         '<td class="'+cls(net)+'" style="font-weight:700">'+sign(net)+'$'+num(net)+'</td>'+
+        '<td class="mut">'+dur(t.durationMs)+'</td>'+
         '<td class="mut">'+t.reason+'</td></tr>';
     }).join('');
   }
@@ -1242,15 +1098,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // ==================================================================
 async function start() {
   logLine(`🚀 Itachi Multi — ${MODE.toUpperCase()} — ${ALL_SYMBOLS.length} symboles — capital $${CAPITAL_START}`);
-  logLine(`📐 SERVEUR 3.4 — SL -${STRAT.SL_PCT * 100}% — trailing net arme +${STRAT.NET_PROFIT_ARM*100}%, verrou +${STRAT.NET_PROFIT_LOCK*100}%, suit -${STRAT.TRAIL_PCT*100}% — Q>=${STRAT.Q_MIN_CALM} — levier x2-x11 — mise 90-280$ selon conditions — entrée MAKER (${STRAT.FEE_MAKER*100}%) — 10 trades — max 15min — kill -45%`);
+  logLine(`📐 SERVEUR 5.0 SCALPING — mean-reversion (Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}σ + RSI${STRAT.RSI_SCALP}) — maker-only — levier x${STRAT.LEV} — TP +${STRAT.TP_PCT*100}% / SL -${STRAT.SL_PCT*100}% — time-stop ${STRAT.TIME_STOP_MS/60000}min — filtre régime ADX<${STRAT.ADX_RANGE_MAX} — coupe-circuit ${STRAT.MAX_CONSEC_LOSSES} pertes — kill -${STRAT.KILL_PCT*100}%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
   await refreshAllKlines();
   connectPriceStreams();
-  setInterval(refreshAllKlines, 30000);
-  setInterval(rankActiveSymbols, STRAT.RANK_REFRESH_MS); // re-classement top-N toutes les 5 min
+  // Indicateurs 1m rafraîchis toutes les 15s (le refresh parallèle prend ~300ms).
+  setInterval(refreshAllKlines, 15000);
+  // rankActiveSymbols est déjà appelé à chaque refreshAllKlines ; pas de doublon nécessaire.
   setInterval(reconcile, 9000);
-  setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 3000); // mini-courbes vivantes
+  setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 3000);
   server.listen(PORT, () => logLine(`🌐 Dashboard sur le port ${PORT}`));
 }
 
