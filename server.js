@@ -1,29 +1,34 @@
 /* ============================================================
- *  SERVEUR 3.6 - TRADE 1J   (swing mean-reversion + correctifs)
+ *  SERVEUR 3.7 - TRADE 1J   (multi-régime, réconciliation, chrono)
  *  ------------------------------------------------------------
- *  Base 3.5, avec 3 apports majeurs :
+ *  Base 3.6, avec 3 correctifs majeurs demandés :
  *
- *  1. CORRECTIF BUG -4005 "Quantity greater than max quantity" :
- *     - À l'ouverture : la quantité est plafonnée au maxQty du
- *       filtre MARKET_LOT_SIZE ; les tokens trop bon marché pour
- *       la mise (couverture <50%) sont écartés.
- *     - À la fermeture : DÉCOUPAGE automatique en plusieurs ordres
- *       <= maxQty (garde-fou 20 tranches). Débloque les positions
- *       coincées (ex. NFPUSDT à +24% impossible à fermer).
+ *  1. RÉCONCILIATION BIDIRECTIONNELLE (correctif critique) :
+ *     reconcile() interroge TOUTES les positions réelles du compte
+ *     (/fapi/v2/positionRisk sans filtre) à chaque cycle (9s) et :
+ *       - nettoie les positions fantômes (fermées côté Binance) ;
+ *       - ADOPTE les positions orphelines que l'état interne ignorait
+ *         (le bug qui faisait voir 1 position sur 8) pour les gérer
+ *         (stop, trailing, scaling out) et les afficher.
+ *     Un symbole en position hors univers est ré-ajouté au flux prix.
+ *     "Binance = source de vérité" enfin réellement appliqué.
  *
- *  2. SCALING OUT (prise de profit partielle, on laisse courir) :
- *     - +10% -> ferme 34%   |   +20% -> ferme 50% du reste
- *     - le solde court sur le trailing large (capture les +20-35%).
- *     NB : optimise la CAPTURE des gros gains, ne les garantit pas
- *     (le marché seul décide qu'un trade atteigne +20-30%).
+ *  2. CHRONO PAR TRADE : durée live sur chaque position (rouge à
+ *     l'approche du time-stop 24h) + colonne durée dans l'historique.
+ *     Marqueur "adopté" sur les positions reprises par réconciliation.
  *
- *  3. FILTRES ASSOUPLIS "de très peu" (plus de trades, sans casser
- *     la sélectivité) : RSI 30/70 -> 35/65, ADX régime 30 -> 35.
- *     (Reste un bot SWING : quelques trades/jour, pas 5-8/heure —
- *      c'est structurel. Pour la haute fréquence : Serveur 5.0.)
+ *  3. MULTI-RÉGIME "JOUER LA TENDANCE" (jamais de pause) :
+ *     Le régime est déduit de l'ADX 2h ET de sa direction (DI+/DI-) :
+ *       - RANGE (ADX bas)      -> mean-reversion 2 sens (fade extrêmes)
+ *       - UP   (ADX haut, DI+) -> QUE des LONG, sur repli (buy the dip)
+ *       - DOWN (ADX haut, DI-) -> QUE des SHORT, sur rebond (sell rally)
+ *     Le bot ne s'abstient jamais : il s'ALIGNE sur la direction
+ *     dominante au lieu de contrarier. (En marché baissier actuel,
+ *     il short les rebonds — ce qui rend les positions gagnantes.)
+ *     Bonus de score pour l'alignement tendance ; funding souple gardé.
  *
- *  Conserve : MR 1h/2h (Bollinger+RSI), funding souple, univers
- *  volatil dynamique (top 20), SL -2.5%, trailing +1%/-1.5%,
+ *  Conserve : univers volatil dynamique, scaling out (+10%/+20%),
+ *  fermeture en tranches (fix -4005), SL -2.5%, trailing +1%/-1.5%,
  *  levier x2-x5, mise 80-280$, time-stop 24h, kill -25%.
  * ============================================================ */
 /**
@@ -396,15 +401,19 @@ function adx(klines, period = 14) {
   };
   const trS = wilder(tr, period), pS = wilder(plusDM, period), mS = wilder(minusDM, period);
   const dx = [];
+  let lastP = 0, lastM = 0;
   for (let i = 0; i < trS.length; i++) {
     const pDI = 100 * (pS[i] / trS[i]), mDI = 100 * (mS[i] / trS[i]);
+    lastP = pDI; lastM = mDI;
     const sum = pDI + mDI;
     dx.push(sum === 0 ? 0 : 100 * Math.abs(pDI - mDI) / sum);
   }
   if (dx.length < period) return null;
   let adxVal = dx.slice(0, period).reduce((a, b) => a + b, 0) / period;
   for (let i = period; i < dx.length; i++) adxVal = (adxVal * (period - 1) + dx[i]) / period;
-  return adxVal;
+  // Direction : +1 tendance haussière (DI+ > DI-), -1 baissière.
+  const dir = lastP >= lastM ? 1 : -1;
+  return { adx: adxVal, dir, plusDI: lastP, minusDI: lastM };
 }
 function volumeRatio(klines, period) {
   if (!klines || klines.length < period + 1) return null;
@@ -485,8 +494,16 @@ async function refreshKlines(symbol) {
     });
     const kl2 = raw2h.map((c) => ({ time: c[0], high: +c[2], low: +c[3], close: +c[4], vol: +c[5] }));
     S.klines2h = kl2;
-    S.swing.adx = adx(kl2, STRAT.ADX_PERIOD);
-    S.swing.regime = (S.swing.adx != null && S.swing.adx < STRAT.ADX_RANGE_MAX) ? 'RANGE' : 'TREND';
+    const adxObj = adx(kl2, STRAT.ADX_PERIOD);
+    S.swing.adx = adxObj ? adxObj.adx : null;
+    S.swing.adxDir = adxObj ? adxObj.dir : 0; // +1 haussier, -1 baissier
+    // Régime à 3 états (jamais de pause) :
+    //  RANGE (ADX bas) -> mean-reversion 2 sens
+    //  UP  (ADX haut + DI+>DI-) -> tendance haussière : on ne prend que des LONG
+    //  DOWN(ADX haut + DI->DI+) -> tendance baissière : on ne prend que des SHORT
+    if (S.swing.adx == null) S.swing.regime = null;
+    else if (S.swing.adx < STRAT.ADX_RANGE_MAX) S.swing.regime = 'RANGE';
+    else S.swing.regime = S.swing.adxDir > 0 ? 'UP' : 'DOWN';
 
     // Funding rate (signal de retournement, filtre souple)
     S.swing.funding = await fetchFunding(symbol);
@@ -507,49 +524,70 @@ function computeSignal(symbol) {
   const S = state.sym[symbol];
   const sw = S.swing;
   const px = S.price;
-  if (!sw.bb || sw.rsi == null || sw.atrPct == null || px <= 0) return null;
+  if (!sw.bb || sw.rsi == null || sw.atrPct == null || px <= 0 || !sw.regime) return null;
 
-  // Régime : mean-reversion seulement hors tendance forte (ADX 2h bas)
-  if (sw.regime !== 'RANGE') { S.indicators.quality = null; return null; }
-  // Volatilité minimale sur 1h (assez de mouvement pour viser 1-2%)
+  // Volatilité minimale (assez de mouvement pour viser 1-4%)
   if (sw.atrPct < STRAT.ATR_FLOOR_1H) { S.indicators.quality = null; return null; }
-  // Confirmation volume (optionnelle)
   if (STRAT.VOL_CONFIRM && sw.volRatio != null && sw.volRatio < 1.0) { S.indicators.quality = null; return null; }
 
-  // Signal mean-reversion : extrême de Bollinger + RSI extrême
   const belowLower = px <= sw.bb.lower, aboveUpper = px >= sw.bb.upper;
+  const belowMid = px < sw.bb.mid, aboveMid = px > sw.bb.mid;
   const rsiLow = sw.rsi <= STRAT.RSI_OVERSOLD, rsiHigh = sw.rsi >= STRAT.RSI_OVERBOUGHT;
+
   let side = null;
-  if (belowLower && rsiLow) side = 'BUY';
-  else if (aboveUpper && rsiHigh) side = 'SELL';
+  let mode = sw.regime;
+
+  // ================= LOGIQUE MULTI-RÉGIME (jamais de pause) =================
+  if (sw.regime === 'RANGE') {
+    // Mean-reversion : on fade les extrêmes, dans les deux sens.
+    if (belowLower && rsiLow) side = 'BUY';
+    else if (aboveUpper && rsiHigh) side = 'SELL';
+  } else if (sw.regime === 'UP') {
+    // Tendance HAUSSIÈRE : on ne prend QUE des LONG, sur repli (buy the dip).
+    // Entrée quand le prix corrige vers/sous la médiane sans être en survente extrême,
+    // et que le RSI se redresse (>= oversold). On suit la tendance, on ne la contrarie pas.
+    if (belowMid && sw.rsi <= 50 && sw.rsi >= STRAT.RSI_OVERSOLD) side = 'BUY';
+  } else if (sw.regime === 'DOWN') {
+    // Tendance BAISSIÈRE : on ne prend QUE des SHORT, sur rebond (sell the rally).
+    // C'est le régime qui fait gagner les shorts en marché baissier (cf. positions réelles).
+    if (aboveMid && sw.rsi >= 50 && sw.rsi <= STRAT.RSI_OVERBOUGHT) side = 'SELL';
+  }
   if (!side) { S.indicators.quality = null; return null; }
 
   // --- Score de qualité (0-100) ---
   const dist = side === 'BUY' ? (sw.bb.mid - px) / (sw.bb.sd || 1) : (px - sw.bb.mid) / (sw.bb.sd || 1);
-  const distScore = Math.min(35, Math.max(0, dist * 17));
-  const rsiScore = side === 'BUY'
-    ? Math.min(30, (STRAT.RSI_OVERSOLD - sw.rsi + 5) * 2)
-    : Math.min(30, (sw.rsi - STRAT.RSI_OVERBOUGHT + 5) * 2);
+  const distScore = Math.min(35, Math.max(0, Math.abs(dist) * 17));
+  let rsiScore;
+  if (mode === 'RANGE') {
+    rsiScore = side === 'BUY'
+      ? Math.min(30, (STRAT.RSI_OVERSOLD - sw.rsi + 5) * 2)
+      : Math.min(30, (sw.rsi - STRAT.RSI_OVERBOUGHT + 5) * 2);
+  } else {
+    // En tendance, un RSI proche de 50 (momentum sain) vaut mieux qu'un extrême.
+    rsiScore = 30 - Math.min(30, Math.abs(sw.rsi - 50));
+  }
   const volScore = sw.volRatio != null ? Math.min(20, (sw.volRatio - 1) * 20) : 10;
 
-  // --- Filtre FUNDING souple : ajuste le score (ne bloque pas) ---
-  // Funding très positif (longs surchargés) -> bonus SHORT, malus LONG (et inversement).
+  // Bonus d'alignement tendance : en UP/DOWN, trader dans le sens du marché est un +.
+  const trendBonus = (mode === 'UP' && side === 'BUY') || (mode === 'DOWN' && side === 'SELL') ? 10 : 0;
+
+  // --- Filtre FUNDING souple ---
   let fundingScore = 0;
   if (STRAT.FUNDING_SOFT && sw.funding != null) {
     const f = sw.funding;
     if (Math.abs(f) >= STRAT.FUNDING_EXTREME) {
-      const favorsShort = f > 0; // longs paient -> pression baissière à venir
+      const favorsShort = f > 0;
       if ((side === 'SELL' && favorsShort) || (side === 'BUY' && !favorsShort)) fundingScore = STRAT.FUNDING_WEIGHT;
       else fundingScore = -STRAT.FUNDING_WEIGHT;
     }
   }
 
-  const quality = Math.round(Math.max(0, distScore + Math.max(0, rsiScore) + Math.max(0, volScore) + fundingScore));
+  const quality = Math.round(Math.max(0, distScore + Math.max(0, rsiScore) + Math.max(0, volScore) + trendBonus + fundingScore));
   S.indicators.quality = quality;
   S.indicators.bias = side === 'BUY' ? 'LONG' : 'SHORT';
-  S.indicators.breakdown = { dist: Math.round(distScore), rsi: Math.round(Math.max(0, rsiScore)), vol: Math.round(Math.max(0, volScore)), funding: Math.round(fundingScore) };
+  S.indicators.breakdown = { mode, dist: Math.round(distScore), rsi: Math.round(Math.max(0, rsiScore)), vol: Math.round(Math.max(0, volScore)), trend: trendBonus, funding: Math.round(fundingScore) };
 
-  return { side, quality, midBand: sw.bb.mid, symbol };
+  return { side, quality, midBand: sw.bb.mid, symbol, mode };
 }
 
 // Q minimum ADAPTATIF (50-55) : marché agité (ATR élevé) -> seuil bas (plus d'opportunités) ;
@@ -874,12 +912,77 @@ async function symbolTick(symbol) {
 
 async function reconcile() {
   if (!API_KEY || !API_SECRET) return;
-  for (const symbol of ALL_SYMBOLS) {
-    const S = state.sym[symbol];
-    if (!S.position) continue;
-    const real = await fetchPosition(symbol);
-    if (!real) { S.position = null; broadcast({ type: 'positions', positions: livePositions() }); }
+  try {
+    // UN SEUL appel : toutes les positions réelles du compte (source de vérité).
+    const data = await signedRequest('GET', '/fapi/v2/positionRisk', {});
+    if (!Array.isArray(data)) return;
+
+    // Index des positions réelles non nulles.
+    const real = {};
+    for (const p of data) {
+      const amt = parseFloat(p.positionAmt);
+      const step = SYMBOL_INFO[p.symbol] ? SYMBOL_INFO[p.symbol].stepSize : 0.000001;
+      if (Math.abs(amt) >= step) {
+        real[p.symbol] = {
+          side: amt > 0 ? 'BUY' : 'SELL',
+          qty: Math.abs(amt),
+          entry: parseFloat(p.entryPrice),
+          lev: parseFloat(p.leverage) || STRAT.LEV_MAX,
+        };
+      }
+    }
+
+    // 1) Positions FANTÔMES : l'état interne dit "ouvert", Binance dit "fermé" -> on nettoie.
+    for (const symbol of Object.keys(state.sym)) {
+      const S = state.sym[symbol];
+      if (S.position && !real[symbol]) {
+        S.position = null;
+        logLine(`🔄 ${symbol} : position fermée côté Binance — état nettoyé.`);
+      }
+    }
+
+    // 2) Positions ORPHELINES : Binance a une position que l'état interne ignore -> on l'ADOPTE.
+    //    (C'est LE correctif : le bot reprend la main sur des positions qu'il ne suivait plus,
+    //    pour les gérer — stop, trailing, scaling out — au lieu de les laisser flotter.)
+    for (const symbol of Object.keys(real)) {
+      ensureSymbolState(symbol);
+      const S = state.sym[symbol];
+      const r = real[symbol];
+      if (!S.position) {
+        const exits = computeExits(symbol);
+        // On estime la mise à partir de la marge réelle (qty*entry/levier).
+        const stake = (r.qty * r.entry) / (r.lev || 1);
+        S.position = {
+          side: r.side, entry: r.entry, qty: r.qty, stake, lev: r.lev,
+          quality: 0, entryFill: 'taker',
+          slPct: exits.slPct, tpPct: exits.tpPct,
+          sl: r.side === 'BUY' ? r.entry * (1 - exits.slPct) : r.entry * (1 + exits.slPct),
+          tp: r.side === 'BUY' ? r.entry * (1 + exits.tpPct) : r.entry * (1 - exits.tpPct),
+          openedAt: Date.now(), peakPnl: 0, scaleDone: [], adopted: true,
+        };
+        // S'assurer que le symbole est surveillé (flux prix) même hors univers courant.
+        if (!ALL_SYMBOLS.includes(symbol)) { ALL_SYMBOLS.push(symbol); reconnectPriceStreamsSoon(); }
+        logLine(`🩹 ${symbol} : position réelle ADOPTÉE (${r.side} ${r.qty} @ ${r.entry}, x${r.lev}) — désormais gérée.`);
+      } else {
+        // Position connue : on resynchronise qty/entry sur la réalité Binance.
+        S.position.qty = r.qty;
+        S.position.entry = r.entry;
+      }
+    }
+    broadcast({ type: 'positions', positions: livePositions() });
+  } catch (e) {
+    logLine(`⚠️ reconcile: ${e.message}`);
   }
+}
+
+// Reconnexion du flux prix (débounce léger) quand l'univers change via adoption.
+let _reconnectTimer = null;
+function reconnectPriceStreamsSoon() {
+  if (_reconnectTimer) return;
+  _reconnectTimer = setTimeout(() => {
+    _reconnectTimer = null;
+    if (priceWs) { const old = priceWs; priceWs = null; try { old.close(); } catch (e) {} connectPriceStreams(); }
+  }, 2000);
 }
 
 // ==================================================================
@@ -976,6 +1079,8 @@ function livePositions() {
       symbol, side: pos.side, entry: pos.entry, current: px, lev: pos.lev,
       quality: pos.quality, investi: pos.stake, sl: pos.sl, tp: pos.tp,
       pnlPct: pnlPct * 100, netLive: gross - fees,
+      ageMs: Date.now() - (pos.openedAt || Date.now()), timeStopMs: STRAT.TIME_STOP_MS,
+      adopted: !!pos.adopted,
     });
   }
   return out;
@@ -1102,11 +1207,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.6 - trade 1j <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.7 - trade 1j · multi-régime <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.6 trade 1j · MR 1h/2h · scaling out · funding · univers volatil dynamique</div>
+  <div class="sub" id="stratline">3.7 trade 1j · multi-régime (range→MR / tendance→suivi) · réconciliation · chrono · scaling out</div>
 
   <div class="controls">
     <button id="start" class="btn-go">▶ Démarrer</button>
@@ -1130,19 +1235,19 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="sec"><span class="dot"></span>Positions ouvertes</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev·Q</th><th>Entrée</th><th>Actuel</th><th>Investi</th><th>SL</th><th>TP</th><th>P&L live</th></tr></thead>
-    <tbody id="positions"><tr><td colspan="9" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr></tbody>
+    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev·Q</th><th>Entrée</th><th>Actuel</th><th>Investi</th><th>SL</th><th>TP</th><th>⏱ Durée</th><th>P&L live</th></tr></thead>
+    <tbody id="positions"><tr><td colspan="10" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr></tbody>
   </table></div>
 
   <div class="sec"><span class="dot"></span>Surveillance des 20 symboles</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Prix</th><th>Courbe</th><th>Biais</th><th>Q</th><th>RSI</th><th>Funding</th><th>Statut</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Prix</th><th>Courbe</th><th>Biais</th><th>Q</th><th>RSI</th><th>Funding</th><th>Régime</th><th>Statut</th></tr></thead>
     <tbody id="symbols"></tbody>
   </table></div>
 
   <div class="sec"><span class="dot"></span>Historique des trades</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Brut</th><th>Frais Binance</th><th>Net retirable</th><th>Raison</th></tr></thead>
+    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev</th><th>Entrée</th><th>Sortie</th><th>Investi</th><th>P&L%</th><th>Brut</th><th>Frais Binance</th><th>Net retirable</th><th>⏱ Durée</th><th>Raison</th></tr></thead>
     <tbody id="trades"></tbody>
   </table></div>
 
@@ -1157,12 +1262,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   const sign = n => n>=0?'+':'';
   const cls = n => n>=0?'green':'red';
   function px(v){ const n=Number(v); return n>=100?num(n,2):n>=1?num(n,3):num(n,5); }
+  function dur(ms){ if(ms==null)return '—'; let s=Math.floor(ms/1000); const h=Math.floor(s/3600); s%=3600; const m=Math.floor(s/60); const r=s%60; return (h>0?h+'h':'')+(m<10&&h>0?'0':'')+m+':'+(r<10?'0':'')+r; }
 
   function renderStats(s){
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='3.6 trade 1j · MR 1h/2h · scaling out 10/20% · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing large +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · x2-5 · '+(s.strat?s.strat.universe:20)+' cryptos volatiles';
+    $('stratline').textContent='3.7 trade 1j · multi-régime (RANGE→MR / UP→long / DOWN→short) · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · scaling out · x2-5';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1179,12 +1285,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function renderPositions(list){
     const tb=$('positions');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="9" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
+    if(!list||!list.length){tb.innerHTML='<tr><td colspan="10" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
     tb.innerHTML=list.map(p=>{
       const sc=p.side==='BUY'?'long':'short',st=p.side==='BUY'?'LONG':'SHORT';
       return '<tr><td>'+p.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td>'+
         '<td>'+p.lev+'x·Q'+p.quality+'</td><td>'+px(p.entry)+'</td><td>'+px(p.current)+'</td>'+
         '<td>$'+num(p.investi)+'</td><td class="red">'+px(p.sl)+'</td><td class="green">'+px(p.tp)+'</td>'+
+        '<td class="'+((p.timeStopMs&&p.ageMs>p.timeStopMs*0.8)?'red':'mut')+'">'+dur(p.ageMs)+(p.adopted?' <span style="color:var(--amber);font-size:9px">adopté</span>':'')+'</td>'+
         '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td></tr>';
     }).join('');
   }
@@ -1214,19 +1321,21 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       const qcol=s.quality>=49?'cyan':'mut';
       const fnd=s.funding!=null?(s.funding>=0?'+':'')+(s.funding*100).toFixed(3)+'%':'—';
       const fndCol=s.funding!=null&&Math.abs(s.funding)>=0.0005?(s.funding>0?'red':'green'):'mut';
+      const regTxt=s.regime==='UP'?'<span style="color:var(--green)">▲ UP</span>':s.regime==='DOWN'?'<span style="color:var(--red)">▼ DOWN</span>':s.regime==='RANGE'?'<span style="color:var(--cyan)">↔ RANGE</span>':'—';
       return '<tr><td>'+s.symbol+'</td><td>'+(s.price?px(s.price):'—')+'</td>'+
         '<td>'+sparkline(s.spark)+'</td>'+
         '<td><span class="pill '+bc+'">'+b+'</span></td>'+
         '<td class="qbadge '+qcol+'">'+q+'</td>'+
         '<td>'+(s.rsi!=null?s.rsi.toFixed(0):'—')+'</td>'+
         '<td class="'+fndCol+'">'+fnd+'</td>'+
+        '<td>'+regTxt+'</td>'+
         '<td>'+(s.hasPosition?'<span class="pill long">EN POSITION</span>':'<span class="mut">-</span>')+'</td></tr>';
     }).join('');
   }
 
   function renderTrades(list){
     const tb=$('trades');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
+    if(!list||!list.length){tb.innerHTML='<tr><td colspan="12" class="mut" style="text-align:center;padding:14px">Aucun trade</td></tr>';return;}
     tb.innerHTML=list.map(t=>{
       const net=Number(t.net),gross=Number(t.gross!=null?t.gross:net),sc=t.side==='BUY'?'long':'short',st=t.side==='BUY'?'LONG':'SHORT';
       return '<tr><td>'+t.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td><td>'+t.lev+'x</td>'+
@@ -1235,6 +1344,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         '<td class="'+cls(gross)+'">'+sign(gross)+'$'+num(gross)+'</td>'+
         '<td class="mut">-$'+num(t.fees)+'</td>'+
         '<td class="'+cls(net)+'" style="font-weight:700">'+sign(net)+'$'+num(net)+'</td>'+
+        '<td class="mut">'+dur(t.durationMs)+'</td>'+
         '<td class="mut">'+t.reason+'</td></tr>';
     }).join('');
   }
@@ -1262,7 +1372,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`🚀 Itachi — SERVEUR 3.6 TRADE 1J — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`🚀 Itachi — SERVEUR 3.7 TRADE 1J (multi-régime) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
   logLine(`📐 Swing mean-reversion 1h/2h — Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}σ + RSI${STRAT.RSI_PERIOD} (${STRAT.RSI_OVERSOLD}/${STRAT.RSI_OVERBOUGHT}) — régime ADX2h<${STRAT.ADX_RANGE_MAX} — funding souple — SL -${STRAT.SL_PCT*100}% / trailing large armé +${STRAT.TRAIL_ARM*100}% suit -${STRAT.TRAIL_PCT*100}% — levier x2-x5 — mise ${STRAT.STAKE_MIN_USD}-${STRAT.STAKE_MAX_USD}$ — ${STRAT.MAX_POSITIONS_CAP} pos — time-stop 24h — kill -${STRAT.KILL_PCT*100}%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
