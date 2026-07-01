@@ -1,28 +1,25 @@
 /* ============================================================
- *  SERVEUR 3.8 - 1J - MAJ   (35 symboles noyau fixe + anti-ban)
+ *  SERVEUR 3.8 - 1J - MAJ  (nettoyé & robustifié)
  *  ------------------------------------------------------------
- *  UNIVERS = 35 : NOYAU FIXE de 5 (BTC, ETH, BNB, SOL, DOGE,
- *  toujours présents, jamais évincés par le scan) + 30 perpétuels
- *  USDT les plus VOLATILS (volume >= 50M$), re-scannés chaque heure.
- *  Choix de 35 (vs 45) : au-delà, la "volatilité" vient surtout de
- *  l'illiquidité (slippage, faux signaux) -> on écarte le bruit.
- *  Le noyau ancre l'univers sur des actifs liquides qui portent le
- *  régime de marché ; la couche volatile va chercher l'opportunité.
+ *  Version relue : code mort retiré (ema/trendFromCloses hérités
+ *  du trend-following, params STRAT inutilisés), démarrage
+ *  robustifié. STRATÉGIE STRICTEMENT INCHANGÉE (vérifiée).
  *
- *  PROTECTIONS ANTI-BAN Binance (indispensables en multi-symboles) :
- *   - Moniteur de poids : lit X-MBX-USED-WEIGHT-1M à chaque réponse.
- *     À 80% du budget (2400/min USD-M), temporise ; sur 418/429/-1003,
- *     met le bot en PAUSE de sécurité 60s (évite le ban 2min->3j).
- *   - Fetch étalé : lots de 5 + micro-pause (lisse le pic de démarrage).
- *   - Aucun ordre ni cycle klines pendant une pause rate-limit.
- *   Charge estimée en régime : ~220/2400 poids/min (~9%). Large marge.
+ *  Correctifs de robustesse :
+ *   - server.listen bind sur '0.0.0.0' (nécessaire au routage Railway).
+ *   - Log explicite du port : indique si Railway injecte PORT ou si
+ *     on tombe sur le fallback 8080 (diagnostic du dashboard figé).
  *
- *  Conserve tout le 3.8 : jusqu'à 25 positions, rotation de capital
- *  (mini-perte + essoufflé 30min + signal Q>=68, 1/symbole/30min),
- *  clôture manuelle (totale/partielle), assouplissement RANGE
- *  togglable, réconciliation (adoption), chrono, multi-régime par
- *  symbole (RANGE/UP/DOWN, jamais de pause), scaling out, SL -2.5%,
- *  trailing +1%/-1.5%, levier x2-x5, mise 80-280$, kill -25%.
+ *  Rappel : sur Railway, PORT doit être injecté (process.env.PORT).
+ *  Si le log affiche "fallback 8080", générer un domaine public et
+ *  laisser Railway fixer le port (ne jamais coder un port en dur).
+ *
+ *  Stratégie (inchangée) : swing mean-reversion 1h/2h multi-régime
+ *  (RANGE→MR / UP→long / DOWN→short, jamais de pause), univers 35
+ *  (noyau BTC/ETH/BNB/SOL/DOGE + 30 volatils), 25 positions, rotation
+ *  de capital Q68, clôture manuelle, assouplissement togglable,
+ *  réconciliation (adoption), chrono, scaling out, funding souple,
+ *  SL -2.5%, trailing +1%/-1.5%, levier x2-x5, mise 80-280$, anti-ban.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -369,13 +366,6 @@ function roundPrice(symbol, price) {
 // ==================================================================
 // INDICATEURS
 // ==================================================================
-function ema(values, period) {
-  if (values.length < period) return null;
-  const k = 2 / (period + 1);
-  let e = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < values.length; i++) e = values[i] * k + e * (1 - k);
-  return e;
-}
 function rsi(closes, period = 14) {
   if (closes.length < period + 1) return null;
   let g = 0, l = 0;
@@ -386,11 +376,6 @@ function rsi(closes, period = 14) {
   const ag = g / period, al = l / period;
   if (al === 0) return 100;
   return 100 - 100 / (1 + ag / al);
-}
-function trendFromCloses(closes) {
-  const ef = ema(closes, 9), es = ema(closes, 21);
-  if (ef == null || es == null) return 0;
-  return ef > es ? 1 : ef < es ? -1 : 0;
 }
 // ATR normalisé (en % du prix) sur des bougies {high,low,close} — mesure de volatilité
 function atrPct(klines, period = 14) {
@@ -1518,7 +1503,10 @@ async function start() {
   setInterval(refreshUniverse, STRAT.UNIVERSE_REFRESH_MS); // re-scan univers toutes les heures
   setInterval(reconcile, 9000);
   setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 5000);
-  server.listen(PORT, () => logLine(`🌐 Dashboard sur le port ${PORT}`));
+  server.listen(PORT, '0.0.0.0', () => {
+    const source = process.env.PORT ? 'Railway (process.env.PORT)' : 'fallback 8080 — ⚠️ Railway n\'injecte pas PORT !';
+    logLine(`🌐 Dashboard sur le port ${PORT} [${source}]`);
+  });
 }
 
 start();
