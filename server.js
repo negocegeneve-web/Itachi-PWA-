@@ -1,25 +1,31 @@
 /* ============================================================
- *  SERVEUR 3.8 - 1J - MAJ  (nettoyé & robustifié)
+ *  SERVEUR 3.8 - 1J - MAJ  (base 3.7 stable + ajustements stratégie)
  *  ------------------------------------------------------------
- *  Version relue : code mort retiré (ema/trendFromCloses hérités
- *  du trend-following, params STRAT inutilisés), démarrage
- *  robustifié. STRATÉGIE STRICTEMENT INCHANGÉE (vérifiée).
+ *  Reconstruit sur la base 3.7 (celle qui tournait) pour éviter
+ *  tout blocage de démarrage. Ajustements de STRATÉGIE réappliqués :
+ *   - UNIVERS 28 = noyau fixe 5 (BTC/ETH/BNB/SOL/DOGE, toujours là)
+ *     + 23 volatils dynamiques (volume >= 50M$), re-scan horaire.
+ *   - Jusqu'à 25 positions simultanées (exposition 600%).
+ *   - ROTATION DE CAPITAL : ferme un mini-perdant essoufflé
+ *     (0..-0.5%, >=30min, jamais +0.5%) pour un signal Q>=68,
+ *     uniquement quand les slots sont pleins ; 1/symbole/30min.
+ *   - CLÔTURE MANUELLE par position (totale/partielle) + verrou
+ *     anti-réconciliation.
+ *   - Assouplissement RANGE TOGGLABLE (bouton) : RSI très extrême
+ *     (<=25 / >=75) suffit même sans franchir la bande.
  *
- *  Correctifs de robustesse :
- *   - server.listen bind sur '0.0.0.0' (nécessaire au routage Railway).
- *   - Log explicite du port : indique si Railway injecte PORT ou si
- *     on tombe sur le fallback 8080 (diagnostic du dashboard figé).
+ *  Robustesse démarrage : server.listen sur '0.0.0.0' + log qui
+ *  indique si Railway injecte PORT (sinon fallback 8080 signalé).
  *
- *  Rappel : sur Railway, PORT doit être injecté (process.env.PORT).
- *  Si le log affiche "fallback 8080", générer un domaine public et
- *  laisser Railway fixer le port (ne jamais coder un port en dur).
+ *  Hérité 3.7 (inchangé) : réconciliation bidirectionnelle
+ *  (adoption des positions orphelines), chrono par trade,
+ *  multi-régime (RANGE/UP/DOWN, jamais de pause), scaling out,
+ *  fermeture en tranches (fix -4005), SL -2.5%, trailing +1%/-1.5%,
+ *  levier x2-x5, mise 80-280$, funding souple, kill -25%.
  *
- *  Stratégie (inchangée) : swing mean-reversion 1h/2h multi-régime
- *  (RANGE→MR / UP→long / DOWN→short, jamais de pause), univers 35
- *  (noyau BTC/ETH/BNB/SOL/DOGE + 30 volatils), 25 positions, rotation
- *  de capital Q68, clôture manuelle, assouplissement togglable,
- *  réconciliation (adoption), chrono, scaling out, funding souple,
- *  SL -2.5%, trailing +1%/-1.5%, levier x2-x5, mise 80-280$, anti-ban.
+ *  NB déploiement : si le dashboard reste figé, vérifier côté
+ *  RAILWAY (générer un domaine public + laisser Railway fixer le
+ *  port) — le log de démarrage dira si PORT est bien injecté.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -81,12 +87,10 @@ const STRAT = {
   RSI_OVERSOLD: 35,     // survente -> LONG (assoupli 30->35 : un peu plus d'entrées)
   RSI_OVERBOUGHT: 65,   // surachat -> SHORT (assoupli 70->65)
 
-  // --- Assouplissement d'entrée en RANGE (activable/désactivable à chaud) ---
-  // Si activé : en RANGE, on entre si la bande est touchée OU si le RSI est TRÈS extrême
-  // (sans exiger le franchissement de la bande). Capture les cas type MUSDT (RSI 79).
-  RELAX_RANGE_ENTRY: true, // état par défaut (basculable via le bouton du dashboard)
-  RSI_EXTREME_LOW: 25,     // RSI <= 25 -> LONG autorisé même sans toucher la bande basse
-  RSI_EXTREME_HIGH: 75,    // RSI >= 75 -> SHORT autorisé même sans toucher la bande haute
+  // --- Assouplissement d'entrée en RANGE (togglable à chaud) ---
+  RELAX_RANGE_ENTRY: true,
+  RSI_EXTREME_LOW: 25,     // RSI <= 25 -> LONG même sans toucher la bande basse
+  RSI_EXTREME_HIGH: 75,    // RSI >= 75 -> SHORT même sans toucher la bande haute
   ATR_PERIOD: 14,       // ATR 1h (volatilite, calibrage sorties)
 
   // --- Filtre de regime : ADX sur 4h ---
@@ -138,25 +142,24 @@ const STRAT = {
 
   // --- Positions & risque ---
   MAX_POSITIONS_CAP: 25, // jusqu'a 25 positions simultanees
-  MAX_EXPOSURE_PCT: 6.0, // exposition relevee a 600% (25 pos x mise x levier) - garde-fou
+  MAX_EXPOSURE_PCT: 6.0, // exposition relevee a 600% (garde-fou)
 
-  // --- ROTATION DE CAPITAL : fermer un mini-perdant essouffle pour liberer un slot EXCELLENT ---
-  // Ne se declenche QUE si tous les slots sont pleins ET qu'un signal Q>=seuil attend.
+  // --- ROTATION DE CAPITAL : fermer un mini-perdant essouffle pour un slot EXCELLENT ---
   ROTATION_ENABLED: true,
-  ROTATION_MAX_LOSS: 0.005,     // le trade a fermer doit etre entre 0 et -0.5% (mini-perte)
-  ROTATION_MIN_AGE_MS: 1800000, // ...et ouvert depuis >= 30 min
-  ROTATION_STALE_PEAK: 0.005,   // ...et n'avoir JAMAIS depasse +0.5% (essouffle, ne travaille pas)
-  ROTATION_MIN_Q: 68,           // le signal candidat doit avoir une qualite Q >= 68 (excellent)
-  ROTATION_COOLDOWN_MS: 1800000,// 1 rotation par symbole / 30 min max (anti-emballement frais)
+  ROTATION_MAX_LOSS: 0.005,     // trade a fermer entre 0 et -0.5%
+  ROTATION_MIN_AGE_MS: 1800000, // ouvert >= 30 min
+  ROTATION_STALE_PEAK: 0.005,   // n'a jamais depasse +0.5%
+  ROTATION_MIN_Q: 68,           // signal candidat Q >= 68
+  ROTATION_COOLDOWN_MS: 1800000,// 1 rotation/symbole/30 min
   KILL_PCT: 0.25,        // kill switch -25%
   MAX_CONSEC_LOSSES: 5,  // coupe-circuit apres 5 pertes consecutives
   COOLDOWN_AFTER_STOP_MS: 3600000, // cooldown 1h sur un symbole apres un stop
 
   // --- Univers dynamique : cryptos les plus volatiles de Binance ---
   DYNAMIC_UNIVERSE: true,
-  UNIVERSE_SIZE: 35,        // 35 au total = 5 fixes (noyau) + 30 volatils dynamiques
+  UNIVERSE_SIZE: 28,        // 28 total = 5 fixes (noyau) + 23 volatils dynamiques
   CORE_SYMBOLS: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'DOGEUSDT'], // noyau TOUJOURS présent
-  DYNAMIC_SIZE: 30,         // nb de volatils dynamiques (hors noyau)
+  DYNAMIC_SIZE: 23,         // nb de volatils dynamiques (hors noyau)
   UNIVERSE_REFRESH_MS: 3600000, // re-scan de l'univers toutes les heures
   UNIVERSE_MIN_VOL_USDT: 50000000, // volume 24h minimum 50M$ (liquidite)
 
@@ -220,23 +223,6 @@ function sign(query) {
   return crypto.createHmac('sha256', API_SECRET).update(query).digest('hex');
 }
 
-// ==================================================================
-// MONITEUR DE POIDS API (anti-ban Binance)
-// Lit l'en-tête X-MBX-USED-WEIGHT-1M renvoyé par Binance à chaque réponse.
-// Limite par défaut USD-M : 2400/min. On met le bot en pause auto à 80%.
-// ==================================================================
-const WEIGHT = { used: 0, limit: 2400, threshold: 0.80, pausedForWeight: false, lastSeen: 0 };
-function trackWeight(res) {
-  try {
-    const w = res.headers && res.headers.get && res.headers.get('X-MBX-USED-WEIGHT-1M');
-    if (w != null) { WEIGHT.used = parseInt(w, 10) || WEIGHT.used; WEIGHT.lastSeen = Date.now(); }
-  } catch (e) { /* ignore */ }
-}
-// À appeler avant les cycles lourds : renvoie true s'il faut temporiser.
-function weightSaturated() {
-  return WEIGHT.used >= WEIGHT.limit * WEIGHT.threshold;
-}
-
 async function signedRequest(method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
@@ -246,17 +232,10 @@ async function signedRequest(method, path, params = {}) {
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
     const res = await fetch(url, { method, headers: { 'X-MBX-APIKEY': API_KEY }, signal: controller.signal });
-    trackWeight(res);
     const data = await res.json();
     if (!res.ok) {
       const err = new Error(`Binance ${res.status}: ${JSON.stringify(data)}`);
       err.binanceCode = data && data.code;
-      // Ban de poids (-1003) ou 418/429 : on met le bot en pause de sécurité.
-      if (res.status === 418 || res.status === 429 || (data && data.code === -1003)) {
-        WEIGHT.pausedForWeight = true;
-        logLine(`🛑 RATE-LIMIT Binance (${res.status}) — pause de sécurité 60s pour éviter le ban.`);
-        setTimeout(() => { WEIGHT.pausedForWeight = false; logLine('✅ Reprise après pause rate-limit.'); }, 60000);
-      }
       throw err;
     }
     return data;
@@ -281,7 +260,6 @@ async function publicGet(base, path, params = {}, retries = 2) {
     try {
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
-      trackWeight(res);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -366,6 +344,13 @@ function roundPrice(symbol, price) {
 // ==================================================================
 // INDICATEURS
 // ==================================================================
+function ema(values, period) {
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  let e = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < values.length; i++) e = values[i] * k + e * (1 - k);
+  return e;
+}
 function rsi(closes, period = 14) {
   if (closes.length < period + 1) return null;
   let g = 0, l = 0;
@@ -376,6 +361,11 @@ function rsi(closes, period = 14) {
   const ag = g / period, al = l / period;
   if (al === 0) return 100;
   return 100 - 100 / (1 + ag / al);
+}
+function trendFromCloses(closes) {
+  const ef = ema(closes, 9), es = ema(closes, 21);
+  if (ef == null || es == null) return 0;
+  return ef > es ? 1 : ef < es ? -1 : 0;
 }
 // ATR normalisé (en % du prix) sur des bougies {high,low,close} — mesure de volatilité
 function atrPct(klines, period = 14) {
@@ -457,7 +447,7 @@ async function scanUniverse() {
     const scored = tickers
       .filter((t) => t.symbol && t.symbol.endsWith('USDT'))
       .filter((t) => !/(UPUSDT|DOWNUSDT|BULLUSDT|BEARUSDT)$/.test(t.symbol))
-      .filter((t) => !core.includes(t.symbol)) // le noyau est ajouté à part, pas de doublon
+      .filter((t) => !core.includes(t.symbol))
       .map((t) => {
         const high = parseFloat(t.highPrice), low = parseFloat(t.lowPrice);
         const quoteVol = parseFloat(t.quoteVolume);
@@ -466,19 +456,15 @@ async function scanUniverse() {
       })
       .filter((t) => t.quoteVol >= STRAT.UNIVERSE_MIN_VOL_USDT)
       .sort((a, b) => b.amplitude - a.amplitude);
-
     const volatile = scored.slice(0, STRAT.DYNAMIC_SIZE).map((t) => t.symbol);
-    // Univers final = NOYAU FIXE (toujours) + volatils dynamiques.
     const top = [...core, ...volatile];
     if (top.length === 0) throw new Error('aucun symbole après filtres');
-
-    // Conserver les symboles déjà en position (pour les gérer jusqu'à la sortie).
     for (const s of Object.keys(state.sym)) {
       if (state.sym[s].position && !top.includes(s)) top.push(s);
     }
     return top;
   } catch (e) {
-    logLine(`⚠️ scanUniverse: ${e.message} — repli sur noyau + liste statique`);
+    logLine(`⚠️ scanUniverse: ${e.message} — repli sur noyau + statique`);
     return [...STRAT.CORE_SYMBOLS, ...FALLBACK_SYMBOLS.filter((s) => !STRAT.CORE_SYMBOLS.includes(s))];
   }
 }
@@ -564,11 +550,10 @@ function computeSignal(symbol) {
 
   // ================= LOGIQUE MULTI-RÉGIME (jamais de pause) =================
   if (sw.regime === 'RANGE') {
-    // Mean-reversion : on fade les extrêmes, dans les deux sens.
-    // Base stricte : franchissement de bande + RSI en zone.
+    // Mean-reversion : fade les extrêmes (base stricte).
     if (belowLower && rsiLow) side = 'BUY';
     else if (aboveUpper && rsiHigh) side = 'SELL';
-    // Assouplissement (si activé) : RSI TRÈS extrême suffit, même sans toucher la bande.
+    // Assouplissement (togglable) : RSI TRÈS extrême suffit, même sans toucher la bande.
     else if (STRAT.RELAX_RANGE_ENTRY) {
       if (sw.rsi <= STRAT.RSI_EXTREME_LOW && belowMid) side = 'BUY';
       else if (sw.rsi >= STRAT.RSI_EXTREME_HIGH && aboveMid) side = 'SELL';
@@ -745,9 +730,7 @@ async function fetchPosition(symbol) {
 // ==================================================================
 // OUVERTURE / FERMETURE
 // ==================================================================
-// Cherche un trade "essoufflé" à fermer pour libérer un slot vers un signal excellent.
-// Triple condition CUMULÉE : mini-perte contenue + assez vieux + jamais progressé.
-// Renvoie le symbole victime (le PIRE candidat) ou null si aucun ne qualifie.
+// Cherche un trade essoufflé à fermer pour libérer un slot vers un signal excellent.
 function findRotationCandidate(exclude) {
   const now = Date.now();
   let worst = null, worstPnl = Infinity;
@@ -755,8 +738,7 @@ function findRotationCandidate(exclude) {
     if (s === exclude) continue;
     const S = state.sym[s];
     const pos = S.position;
-    if (!pos || pos.closingManual || pos.adopted) continue; // on ne rote pas les adoptées ni celles en clôture manuelle
-    // Cooldown anti-emballement
+    if (!pos || pos.closingManual || pos.adopted) continue;
     if (S.lastRotationAt && now - S.lastRotationAt < STRAT.ROTATION_COOLDOWN_MS) continue;
     const px = S.price;
     if (px <= 0) continue;
@@ -764,22 +746,15 @@ function findRotationCandidate(exclude) {
     const pnlPct = ((px - pos.entry) / pos.entry) * dir;
     const age = now - (pos.openedAt || now);
     const peak = pos.peakPnl != null ? pos.peakPnl : 0;
-    // 1) mini-perte : entre 0 et -ROTATION_MAX_LOSS
     const miniLoss = pnlPct <= 0 && pnlPct >= -STRAT.ROTATION_MAX_LOSS;
-    // 2) assez vieux
     const oldEnough = age >= STRAT.ROTATION_MIN_AGE_MS;
-    // 3) jamais progressé (n'a jamais dépassé le seuil de "vie")
     const staled = peak < STRAT.ROTATION_STALE_PEAK;
-    if (miniLoss && oldEnough && staled) {
-      // On choisit le plus mauvais (pnl le plus bas) parmi les candidats.
-      if (pnlPct < worstPnl) { worstPnl = pnlPct; worst = s; }
-    }
+    if (miniLoss && oldEnough && staled && pnlPct < worstPnl) { worstPnl = pnlPct; worst = s; }
   }
   return worst;
 }
 
 async function tryOpen(symbol, signal) {
-  if (WEIGHT.pausedForWeight) return; // pause de sécurité rate-limit : pas de nouvel ordre
   const S = state.sym[symbol];
   const now = Date.now();
   if (!S || S.position) return;
@@ -789,7 +764,6 @@ async function tryOpen(symbol, signal) {
   if (S.lastStopAt && now - S.lastStopAt < STRAT.COOLDOWN_AFTER_STOP_MS) return;
 
   const { stake, lev } = sizing(signal);
-  // Slots pleins : tenter une ROTATION si le signal est EXCELLENT (Q>=seuil).
   if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) {
     if (STRAT.ROTATION_ENABLED && signal.quality >= STRAT.ROTATION_MIN_Q) {
       const victim = findRotationCandidate(symbol);
@@ -797,12 +771,8 @@ async function tryOpen(symbol, signal) {
         logLine(`🔁 ROTATION : fermeture ${victim} (essoufflé) pour libérer un slot -> ${symbol} Q${signal.quality}.`);
         state.sym[victim].lastRotationAt = Date.now();
         await closePos(victim, 'ROTATION');
-      } else {
-        return; // aucun candidat à libérer -> on n'ouvre pas
-      }
-    } else {
-      return; // slots pleins et signal pas assez bon pour justifier une rotation
-    }
+      } else { return; }
+    } else { return; }
   }
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
@@ -1014,7 +984,7 @@ async function reconcile() {
     // 1) Positions FANTÔMES : l'état interne dit "ouvert", Binance dit "fermé" -> on nettoie.
     for (const symbol of Object.keys(state.sym)) {
       const S = state.sym[symbol];
-      if (S.position && S.position.closingManual) continue; // fermeture manuelle en cours : on ne touche pas
+      if (S.position && S.position.closingManual) continue; // fermeture manuelle en cours
       if (S.position && !real[symbol]) {
         S.position = null;
         logLine(`🔄 ${symbol} : position fermée côté Binance — état nettoyé.`);
@@ -1118,18 +1088,10 @@ async function refreshUniverse() {
 }
 
 async function refreshAllKlines() {
-  // Anti-ban : si Binance nous a mis en pause (418/429/-1003), on saute ce cycle.
-  if (WEIGHT.pausedForWeight) { logLine('⏳ Cycle klines sauté (pause rate-limit active).'); return; }
-  const BATCH = 5;
+  const BATCH = 4;
   for (let i = 0; i < ALL_SYMBOLS.length; i += BATCH) {
-    // Si on approche 80% du budget de poids, on temporise pour laisser l'intervalle se réinitialiser.
-    if (weightSaturated()) {
-      logLine(`⏳ Poids API à ${WEIGHT.used}/${WEIGHT.limit} — pause 5s pour éviter le ban.`);
-      await new Promise((r) => setTimeout(r, 5000));
-    }
     const slice = ALL_SYMBOLS.slice(i, i + BATCH);
     await Promise.all(slice.map((s) => refreshKlines(s)));
-    await new Promise((r) => setTimeout(r, 120)); // micro-pause entre lots (lisse le pic)
   }
   rankActiveSymbols();
   broadcast({ type: 'snapshot', data: snapshot() });
@@ -1201,7 +1163,7 @@ function snapshot() {
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
     trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
-    strat: { sl: STRAT.SL_PCT * 100, trailArm: STRAT.TRAIL_ARM * 100, trailPct: STRAT.TRAIL_PCT * 100, lev: '2-5', universe: state.universe.length, relaxOn: STRAT.RELAX_RANGE_ENTRY, weight: WEIGHT.used, weightLimit: WEIGHT.limit },
+    strat: { sl: STRAT.SL_PCT * 100, trailArm: STRAT.TRAIL_ARM * 100, trailPct: STRAT.TRAIL_PCT * 100, lev: '2-5', universe: state.universe.length, relaxOn: STRAT.RELAX_RANGE_ENTRY },
   };
 }
 
@@ -1241,18 +1203,16 @@ wss.on('connection', (ws) => {
       for (const s of Object.keys(state.sym)) if (state.sym[s].position) await closePos(s, 'MANUEL');
       logLine('🧹 Fermeture manuelle de TOUTES les positions');
     } else if (cmd.action === 'closeManual') {
-      // Clôture manuelle d'UNE position (totale ou partielle), quel que soit le P&L.
       const sym = cmd.symbol;
       const S = sym && state.sym[sym];
       if (!S || !S.position) { logLine(`⚠️ closeManual: pas de position sur ${sym}`); return; }
       const pct = cmd.pct != null ? Math.max(1, Math.min(100, parseFloat(cmd.pct))) : 100;
       const qtyToClose = pct >= 100 ? null : roundQty(sym, S.position.qty * (pct / 100));
-      S.position.closingManual = true; // verrou anti-réconciliation pendant la fermeture
+      S.position.closingManual = true;
       logLine(`👤 CLÔTURE MANUELLE ${sym} — ${pct}%`);
       await closePos(sym, pct >= 100 ? 'MANUEL' : `MANUEL-${pct}%`, qtyToClose);
       if (state.sym[sym] && state.sym[sym].position) state.sym[sym].position.closingManual = false;
     } else if (cmd.action === 'toggleRelax') {
-      // Bouton on/off de l'assouplissement d'entrée en RANGE.
       STRAT.RELAX_RANGE_ENTRY = !STRAT.RELAX_RANGE_ENTRY;
       logLine(`🔧 Assouplissement RANGE : ${STRAT.RELAX_RANGE_ENTRY ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
       broadcast({ type: 'snapshot', data: snapshot() });
@@ -1312,11 +1272,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.8 - 1J - MAJ <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.8 - 1J - MAJ · 28 sym <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.8 - 1J - MAJ · 35 symboles (5 fixes + 30 volatils) · 25 trades · rotation · anti-ban</div>
+  <div class="sub" id="stratline">3.8-1J-MAJ · 28 sym (5 fixes+23 vol) · 25 trades · rotation · clôture manuelle · multi-régime</div>
 
   <div class="controls">
     <button id="start" class="btn-go">▶ Démarrer</button>
@@ -1375,7 +1335,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
-    $('stratline').textContent='3.8-1J-MAJ · 35 sym (5 fixes+30 vol) · 25 trades · rotation Q68 · multi-régime (RANGE→MR / UP→long / DOWN→short) · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · scaling out · x2-5';
+    $('stratline').textContent='3.8-1J-MAJ · 28 sym · 25 trades · rotation Q68 · multi-régime (RANGE→MR / UP→long / DOWN→short) · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · scaling out · x2-5';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1400,7 +1360,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         '<td>$'+num(p.investi)+'</td><td class="red">'+px(p.sl)+'</td><td class="green">'+px(p.tp)+'</td>'+
         '<td class="'+((p.timeStopMs&&p.ageMs>p.timeStopMs*0.8)?'red':'mut')+'">'+dur(p.ageMs)+(p.adopted?' <span style="color:var(--amber);font-size:9px">adopté</span>':'')+'</td>'+
         '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td>'+
-        '<td style="white-space:nowrap"><input id="pct_'+p.symbol+'" type="number" min="1" max="100" value="100" style="width:44px;background:#0e151d;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:3px 4px;font-size:11px"/>%'+
+        '<td style="white-space:nowrap"><input id="pct_'+p.symbol+'" type="number" min="1" max="100" value="100" style="width:42px;background:#0e151d;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:3px;font-size:11px"/>%'+
         ' <button onclick="closePos(\''+p.symbol+'\')" style="background:rgba(255,84,112,.15);color:var(--red);border:1px solid rgba(255,84,112,.3);border-radius:6px;padding:4px 8px;font-size:11px;font-weight:700;cursor:pointer">Fermer</button></td></tr>';
     }).join('');
   }
@@ -1474,8 +1434,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   window.closePos=function(sym){
     const inp=document.getElementById('pct_'+sym);
     const pct=inp?Math.max(1,Math.min(100,Number(inp.value)||100)):100;
-    const msg=pct>=100?('Fermer TOUTE la position '+sym+' ?'):('Fermer '+pct+'% de '+sym+' ?');
-    if(confirm(msg)) ws.send(JSON.stringify({action:'closeManual',symbol:sym,pct:pct}));
+    if(confirm(pct>=100?('Fermer TOUTE la position '+sym+' ?'):('Fermer '+pct+'% de '+sym+' ?'))) ws.send(JSON.stringify({action:'closeManual',symbol:sym,pct:pct}));
   };
   $('toggleRelax').onclick=()=>ws.send(JSON.stringify({action:'toggleRelax'}));
   $('start').onclick=()=>ws.send(JSON.stringify({action:'start'}));
@@ -1488,7 +1447,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`🚀 Itachi — SERVEUR 3.8-1J-MAJ (35 sym: 5 fixes+30 vol, 25 trades, rotation, multi-régime, clôture manuelle) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`🚀 Itachi — SERVEUR 3.8-1J-MAJ (28 sym: 5 fixes+23 vol, 25 trades, rotation) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
   logLine(`📐 Swing mean-reversion 1h/2h — Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}σ + RSI${STRAT.RSI_PERIOD} (${STRAT.RSI_OVERSOLD}/${STRAT.RSI_OVERBOUGHT}) — régime ADX2h<${STRAT.ADX_RANGE_MAX} — funding souple — SL -${STRAT.SL_PCT*100}% / trailing large armé +${STRAT.TRAIL_ARM*100}% suit -${STRAT.TRAIL_PCT*100}% — levier x2-x5 — mise ${STRAT.STAKE_MIN_USD}-${STRAT.STAKE_MAX_USD}$ — ${STRAT.MAX_POSITIONS_CAP} pos — time-stop 24h — kill -${STRAT.KILL_PCT*100}%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
@@ -1504,7 +1463,7 @@ async function start() {
   setInterval(reconcile, 9000);
   setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 5000);
   server.listen(PORT, '0.0.0.0', () => {
-    const source = process.env.PORT ? 'Railway (process.env.PORT)' : 'fallback 8080 — ⚠️ Railway n\'injecte pas PORT !';
+    const source = process.env.PORT ? 'Railway' : 'fallback 8080 — ⚠️ Railway n\'injecte pas PORT';
     logLine(`🌐 Dashboard sur le port ${PORT} [${source}]`);
   });
 }
