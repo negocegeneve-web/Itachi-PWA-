@@ -1,31 +1,19 @@
 /* ============================================================
- *  SERVEUR 3.8 - 1J - MAJ  (base 3.7 stable + ajustements stratégie)
+ *  SERVEUR 3.8 - 1J - MAJ  (correctif démarrage)
  *  ------------------------------------------------------------
- *  Reconstruit sur la base 3.7 (celle qui tournait) pour éviter
- *  tout blocage de démarrage. Ajustements de STRATÉGIE réappliqués :
- *   - UNIVERS 28 = noyau fixe 5 (BTC/ETH/BNB/SOL/DOGE, toujours là)
- *     + 23 volatils dynamiques (volume >= 50M$), re-scan horaire.
- *   - Jusqu'à 25 positions simultanées (exposition 600%).
- *   - ROTATION DE CAPITAL : ferme un mini-perdant essoufflé
- *     (0..-0.5%, >=30min, jamais +0.5%) pour un signal Q>=68,
- *     uniquement quand les slots sont pleins ; 1/symbole/30min.
- *   - CLÔTURE MANUELLE par position (totale/partielle) + verrou
- *     anti-réconciliation.
- *   - Assouplissement RANGE TOGGLABLE (bouton) : RSI très extrême
- *     (<=25 / >=75) suffit même sans franchir la bande.
+ *  CORRECTIF CLÉ : le serveur HTTP démarre EN PREMIER (server.listen
+ *  avant tout appel réseau). Le dashboard s'affiche donc immédiatement
+ *  et se remplit ensuite ; l'initialisation (klines des 28 symboles,
+ *  scan univers, flux prix) se fait EN ARRIÈRE-PLAN, non bloquante.
+ *  -> corrige le dashboard figé (l'ancien ordre attendait de charger
+ *     28 symboles avant d'ouvrir le port, ce qui gelait l'affichage).
+ *  Init protégée par try/catch : une panne réseau ne bloque plus
+ *  le démarrage ; les boucles périodiques prennent le relais.
  *
- *  Robustesse démarrage : server.listen sur '0.0.0.0' + log qui
- *  indique si Railway injecte PORT (sinon fallback 8080 signalé).
- *
- *  Hérité 3.7 (inchangé) : réconciliation bidirectionnelle
- *  (adoption des positions orphelines), chrono par trade,
- *  multi-régime (RANGE/UP/DOWN, jamais de pause), scaling out,
- *  fermeture en tranches (fix -4005), SL -2.5%, trailing +1%/-1.5%,
- *  levier x2-x5, mise 80-280$, funding souple, kill -25%.
- *
- *  NB déploiement : si le dashboard reste figé, vérifier côté
- *  RAILWAY (générer un domaine public + laisser Railway fixer le
- *  port) — le log de démarrage dira si PORT est bien injecté.
+ *  Univers 28 = noyau fixe (BTC/ETH/BNB/SOL/DOGE) + 23 volatils.
+ *  25 positions, rotation Q68, clôture manuelle, assoupli togglable,
+ *  multi-régime (RANGE/UP/DOWN), réconciliation, chrono, scaling out.
+ *  Stratégie de fond inchangée (base 3.7).
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -1305,7 +1293,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <tbody id="positions"><tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr></tbody>
   </table></div>
 
-  <div class="sec"><span class="dot"></span>Surveillance des 20 symboles</div>
+  <div class="sec"><span class="dot"></span>Surveillance des symboles</div>
   <div class="table-wrap"><table>
     <thead><tr><th>Symbole</th><th>Prix</th><th>Courbe</th><th>Biais</th><th>Q</th><th>RSI</th><th>Funding</th><th>Régime</th><th>Statut</th></tr></thead>
     <tbody id="symbols"></tbody>
@@ -1447,25 +1435,34 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`🚀 Itachi — SERVEUR 3.8-1J-MAJ (28 sym: 5 fixes+23 vol, 25 trades, rotation) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
-  logLine(`📐 Swing mean-reversion 1h/2h — Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}σ + RSI${STRAT.RSI_PERIOD} (${STRAT.RSI_OVERSOLD}/${STRAT.RSI_OVERBOUGHT}) — régime ADX2h<${STRAT.ADX_RANGE_MAX} — funding souple — SL -${STRAT.SL_PCT*100}% / trailing large armé +${STRAT.TRAIL_ARM*100}% suit -${STRAT.TRAIL_PCT*100}% — levier x2-x5 — mise ${STRAT.STAKE_MIN_USD}-${STRAT.STAKE_MAX_USD}$ — ${STRAT.MAX_POSITIONS_CAP} pos — time-stop 24h — kill -${STRAT.KILL_PCT*100}%`);
-  if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
-  await loadSymbolInfo();
-  // 1) Scanner l'univers volatil AVANT tout (peuple ALL_SYMBOLS)
-  const uni = await scanUniverse();
-  await applyUniverse(uni);
-  // 2) Charger les bougies, connecter les prix
-  await refreshAllKlines();
-  connectPriceStreams();
-  // 3) Boucles périodiques (horizon lent : pas besoin de haute fréquence)
-  setInterval(refreshAllKlines, STRAT.SIGNAL_REFRESH_MS); // ré-évalue les signaux 1h/2h
-  setInterval(refreshUniverse, STRAT.UNIVERSE_REFRESH_MS); // re-scan univers toutes les heures
-  setInterval(reconcile, 9000);
-  setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 5000);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.8-1J-MAJ (28 sym: 5 fixes+23 vol, 25 trades, rotation) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F4D0} Swing mean-reversion 1h/2h — Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}\u03C3 + RSI${STRAT.RSI_PERIOD} (${STRAT.RSI_OVERSOLD}/${STRAT.RSI_OVERBOUGHT}) — SL -${STRAT.SL_PCT*100}% / trailing +${STRAT.TRAIL_ARM*100}%/-${STRAT.TRAIL_PCT*100}% — x2-5 — mise ${STRAT.STAKE_MIN_USD}-${STRAT.STAKE_MAX_USD}$ — ${STRAT.MAX_POSITIONS_CAP} pos — kill -${STRAT.KILL_PCT*100}%`);
+  if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Cles API manquantes — lecture seule (pas d ordres).');
+
+  // 0) LE SERVEUR HTTP DÉMARRE EN PREMIER : le dashboard s'affiche tout de suite,
+  //    avant tout appel réseau. Il se remplit de données ensuite (arrière-plan).
   server.listen(PORT, '0.0.0.0', () => {
-    const source = process.env.PORT ? 'Railway' : 'fallback 8080 — ⚠️ Railway n\'injecte pas PORT';
-    logLine(`🌐 Dashboard sur le port ${PORT} [${source}]`);
+    const source = process.env.PORT ? 'Railway' : "fallback 8080 - Railway n'injecte pas PORT";
+    logLine(`\u{1F310} Dashboard sur le port ${PORT} [${source}] — pret.`);
   });
+
+  // Initialisation NON BLOQUANTE en arrière-plan.
+  (async () => {
+    try {
+      await loadSymbolInfo();
+      const uni = await scanUniverse();
+      await applyUniverse(uni);
+      await refreshAllKlines();
+      connectPriceStreams();
+      logLine('\u2705 Initialisation complete — bot pret a demarrer.');
+    } catch (e) {
+      logLine(`\u26A0\uFE0F Init arriere-plan: ${e.message} — dashboard actif, reessai auto.`);
+    }
+    setInterval(refreshAllKlines, STRAT.SIGNAL_REFRESH_MS);
+    setInterval(refreshUniverse, STRAT.UNIVERSE_REFRESH_MS);
+    setInterval(reconcile, 9000);
+    setInterval(() => broadcast({ type: 'symbols', symbols: symbolsOverview() }), 5000);
+  })();
 }
 
 start();
