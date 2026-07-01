@@ -1,23 +1,23 @@
 /* ============================================================
- *  SERVEUR 3.3 — Itachi Multi (4 trades, fort levier, sortie net-de-frais)
+ *  SERVEUR 3.4 - 280  (MAJ : mise variable, 10 trades, x2-x11)
  *  ------------------------------------------------------------
- *  RÉGLAGES UTILISATEUR :
- *   - 4 trades simultanés
- *   - Durée max d'une position : 20 min (filet ultime)
- *   - Levier x5 -> x20 indexé sur Q (x20 réservé Q>=80)
- *   - Q minimum d'entrée : 53
- *   - Mise FIXE : 280$ par trade
+ *  RÉGLAGES :
+ *   - 10 trades simultanés (exposition totale plafonnée à 200% du capital)
+ *   - Mise VARIABLE 90-280$ selon le nb de conditions du signal :
+ *       0-1 cond -> 90$ | 2 -> 155$ | 3 -> 215$ | 4 -> 280$
+ *   - Levier x2 -> x11 indexé sur Q
+ *   - Q minimum 60 · timeout 15 min · kill -45%
+ *   - Entrée MAKER (post-only 0.02%, fallback market 3s)
  *
- *  SORTIES :
- *   - Stop-loss FIXE : -1% de prix
- *   - Trailing armé quand le profit NET de frais Binance atteint +0.5%
- *     de la mise ; il suit ensuite en valeur NETTE (-0.5% du pic de net)
- *     et ne laisse JAMAIS le net repasser sous +0.5% (bénéfice verrouillé).
- *   - Si le prix continue : la position reste ouverte et court.
- *   - Filet ultime : 20 min.
+ *  SORTIE (trailing NET de frais) :
+ *   - SL fixe -1%
+ *   - Trailing s'arme/sécurise dès +0.3% NET (après frais Binance)
+ *   - Dès que le pic dépasse +0.6% NET, le plancher remonte à +0.6%
+ *     (verrou : le trade ne redescend jamais sous +0.6% net)
+ *   - Suiveur -0.8% du pic net (laisse courir les gros gagnants)
+ *   - Pas de TP fixe.
  *
- *  ⚠️ x20 : un SL -1% = -20% sur la mise (-~56$ sur 280$). Risque
- *  maximal. Q53 = qualité moyenne admise. À VALIDER au /backtest.
+ *  À VALIDER au /backtest (net par trade, pas win rate).
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -60,7 +60,7 @@ const KLINE_BASE = 'https://fapi.binance.com'; // bougies depuis mainnet (testne
 // ==================================================================
 const STRAT = {
   // --- Ratio risque/récompense (SL/TP de base, désormais calibrés par l'ATR) ---
-  // --- Sorties : SL fixe -1%, PAS de TP plafond (on laisse courir), trailing -0.5% ---
+  // --- Sorties : SL fixe -1%, pas de TP fixe — trailing armé au profit NET +0.5% ---
   SL_PCT: 0.010, // -1.0% stop-loss fixe
   TP_PCT: 999, // TP "infini" : aucun plafond, le trade court tant que le trailing tient
   NO_FIXED_TP: true, // marqueur : pas de prise de profit à seuil fixe
@@ -68,15 +68,15 @@ const STRAT = {
   USE_ATR_EXITS: false, // OFF : on garde un SL fixe -1% (pas d'ATR sur les sorties ici)
   ATR_SL_MULT: 1.0, ATR_TP_MULT: 2.0, ATR_TP_CAP: 0.018, ATR_TP_FLOOR: 0.006,
 
-  // --- Trailing : armé à +0.8% (mouvement réel), suit à -0.5% sous le pic ---
-  // --- Trailing armé sur le profit NET de frais (+0.5% net), suit à -0.5% du pic ---
-  NET_PROFIT_ARM: 0.005, // arme le trailing quand le profit NET (après frais Binance) atteint +0.5%
+  // --- Trailing NET de frais : arme/sécurise à +0.3%, verrouille fort à +0.6% ---
+  NET_PROFIT_ARM: 0.003, // arme le trailing dès +0.3% NET (après frais Binance) : sécurise tôt
+  NET_PROFIT_LOCK: 0.006, // à partir de +0.6% net, le plancher remonte à +0.6% (jamais rendu en dessous)
   TRAIL_START: 0.008, // (inutilisé : remplacé par NET_PROFIT_ARM)
-  TRAIL_PCT: 0.005, // une fois armé, stop suiveur à -0.5% du pic
+  TRAIL_PCT: 0.008, // suiveur -0.8% du pic net (laisse courir les gros gagnants)
 
   // --- Sélectivité (Q adaptatif 50-55 selon volatilité du marché) ---
-  Q_MIN_CALM: 53, // Q minimum d'entrée = 53 (fixe)
-  Q_MIN_VOLATILE: 53, // identique : seuil unique à 53
+  Q_MIN_CALM: 60, // Q minimum d'entrée = 60 (plus sélectif : moins de trades, moins de frais)
+  Q_MIN_VOLATILE: 60, // seuil unique à 60
   MTF_REQUIRED: true, // alignement multi-timeframe requis...
   MTF_MIN_ALIGN: 0.125, // ...ALLÉGÉ DE MOITIÉ (0.25 -> 0.125) : laisse passer + de signaux
 
@@ -98,27 +98,39 @@ const STRAT = {
 
   // --- Capital & risque ---
   KILL_PCT: 0.45, // expulsion à -45% du capital (stop bot)
-  MAX_EXPOSURE_PCT: 5.0, // plafond large : la vraie limite = 4 positions x mise fixe 280$
+  MAX_EXPOSURE_PCT: 2.0, // exposition totale plafonnée à 200% du capital (garde-fou pour 10 trades)
   MIN_POSITIONS_TARGET: 1,
-  MAX_POSITIONS_CAP: 4, // plafond dur : 4 trades simultanés
+  MAX_POSITIONS_CAP: 10, // plafond dur : 10 trades simultanés
   FEE_PER_SIDE: 0.0004, // 0.04% taker par leg
+  FEE_MAKER: 0.0002, // 0.02% maker par leg (ordre limite post-only : ~2x moins cher)
+  USE_MAKER_ENTRY: true, // tenter une entrée en limite post-only (maker), fallback market
+  MAKER_WAIT_MS: 3000, // délai d'attente d'exécution du post-only avant fallback market
+  MAKER_OFFSET: 0.0002, // place l'ordre limite 0.02% en retrait du prix (pour rester maker)
 
-  // --- Mise FIXE en $ (280$ par trade) ---
-  USE_FIXED_STAKE: true, // mise fixe en $ au lieu d'un % du capital
-  FIXED_STAKE_USD: 280, // 280$ par trade
-  STAKE_PCT: 0.045, // (inutilisé si USE_FIXED_STAKE)
-  STAKE_PCT_EXCEPTIONAL: 0.09, // (inutilisé si USE_FIXED_STAKE)
+  // --- Mise VARIABLE 90-280$ selon le nombre de conditions du signal (0..4) ---
+  // Plus le signal réunit de bonnes conditions (EMA large, momentum, RSI, S/R),
+  // plus la mise est grosse. On risque peu sur les signaux moyens, plus sur les bons.
+  USE_FIXED_STAKE: false, // mise variable (barème ci-dessous)
+  STAKE_BY_CONDITIONS: [ // index = nb de conditions réunies (0 à 4)
+    90,  // 0 condition
+    90,  // 1 condition
+    155, // 2 conditions
+    215, // 3 conditions
+    280, // 4 conditions
+  ],
+  FIXED_STAKE_USD: 280, // (inutilisé si USE_FIXED_STAKE=false)
+  STAKE_PCT: 0.045, // (inutilisé)
+  STAKE_PCT_EXCEPTIONAL: 0.09, // (inutilisé)
   MAX_EXCEPTIONAL_CONCURRENT: 4,
 
-  // --- Levier progressif x5 -> x20, indexé sur le Quality score ---
-  // x20 réservé aux Q>=80 ; les Q faibles (53-59) reçoivent x5.
-  LEV_MAX: 20, // levier max (mise exceptionnelle ou Q>=80)
+  // --- Levier x2 -> x11, indexé sur Q ---
+  LEV_MAX: 11, // levier max (Q>=80)
   LEV_BY_Q: [ // premier palier dont le seuil Q est atteint
-    { q: 80, lev: 20 },
-    { q: 74, lev: 16 },
-    { q: 67, lev: 12 },
-    { q: 60, lev: 8 },
-    { q: 0,  lev: 5 }, // Q 53-59 -> levier plancher x5
+    { q: 80, lev: 11 },
+    { q: 74, lev: 9 },
+    { q: 67, lev: 7 },
+    { q: 60, lev: 5 },
+    { q: 0,  lev: 2 }, // Q < 60 (rare) -> levier plancher x2
   ],
 
   // --- Bonus mise exceptionnelle 9% : 2 portes ---
@@ -138,7 +150,7 @@ const STRAT = {
   MIN_GAP_MS: 840000, // 14 min minimum entre 2 entrées (même symbole)
   TIME_EXIT_INTERMEDIATE: false, // fenêtre intermédiaire DÉSACTIVÉE (pas de TEMPS-PROFIT/PERTE/REBOND)
   TIME_EXIT_FROM: 60000, // (inutilisé si TIME_EXIT_INTERMEDIATE=false)
-  TIME_EXIT_HARD: 1200000, // filet ultime : sortie forcée à 20 min
+  TIME_EXIT_HARD: 900000, // filet ultime : sortie forcée à 15 min
   TIME_EXIT_GIVEBACK: 0.004, // (inutilisé si fenêtre off)
   TIME_EXIT_WORSENING: -0.006, // (inutilisé si fenêtre off)
   TF_PRINCIPAL: '5m', // timeframe d'analyse principal
@@ -275,6 +287,7 @@ async function loadSymbolInfo() {
         const lot = sym.filters.find((f) => f.filterType === 'LOT_SIZE');
         SYMBOL_INFO[sym.symbol] = {
           qtyPrecision: sym.quantityPrecision,
+          pricePrecision: sym.pricePrecision,
           stepSize: lot ? parseFloat(lot.stepSize) : 0.001,
         };
       }
@@ -288,6 +301,10 @@ async function loadSymbolInfo() {
 function roundQty(symbol, q) {
   const p = SYMBOL_INFO[symbol] ? SYMBOL_INFO[symbol].qtyPrecision : 3;
   return parseFloat(q.toFixed(p));
+}
+function roundPrice(symbol, price) {
+  const p = SYMBOL_INFO[symbol] && SYMBOL_INFO[symbol].pricePrecision != null ? SYMBOL_INFO[symbol].pricePrecision : 4;
+  return parseFloat(price.toFixed(p));
 }
 
 // ==================================================================
@@ -406,7 +423,7 @@ function computeSignal(symbol) {
   if (!bull && !bear) { S.indicators.quality = null; return null; }
   const isLong = bull;
 
-  // Alignement MTF ALLÉGÉ (0.10 au lieu de 0.30) — débloque les trades
+  // Alignement MTF allégé (0.125) — débloque les trades
   const align = S.mtf.alignNorm;
   const aligned = isLong ? align : -align;
   if (STRAT.MTF_REQUIRED && (align == null || aligned <= STRAT.MTF_MIN_ALIGN)) {
@@ -537,10 +554,16 @@ function sizing(signal) {
     viaRelaxed = false;
   }
 
-  // Mise : fixe en $ (280$) si activé, sinon % du capital.
-  const stake = STRAT.USE_FIXED_STAKE
-    ? STRAT.FIXED_STAKE_USD
-    : state.capital * (isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT);
+  // Mise : variable selon le nb de conditions du signal (barème 90-280$), sinon fixe/%.
+  let stake;
+  if (STRAT.USE_FIXED_STAKE) {
+    stake = STRAT.FIXED_STAKE_USD;
+  } else if (STRAT.STAKE_BY_CONDITIONS) {
+    const idx = Math.max(0, Math.min(4, cond)); // cond = nb de conditions (0..4)
+    stake = STRAT.STAKE_BY_CONDITIONS[idx];
+  } else {
+    stake = state.capital * (isExceptional ? STRAT.STAKE_PCT_EXCEPTIONAL : STRAT.STAKE_PCT);
+  }
   const lev = levForQuality(signal.quality, isExceptional);
 
   return { stake, lev, isExceptional, viaRelaxed };
@@ -566,6 +589,60 @@ async function marketOrder(symbol, side, qty, reduceOnly = false) {
   const params = { symbol, side, type: 'MARKET', quantity: qty };
   if (reduceOnly) params.reduceOnly = 'true';
   return signedRequest('POST', '/fapi/v1/order', params);
+}
+
+// Ordre LIMITE post-only (maker) : ne s'exécute QUE comme maker (frais réduits).
+// Si le prix devait le rendre taker, Binance le rejette (timeInForce GTX = post-only).
+async function limitMakerOrder(symbol, side, qty, price) {
+  const p = roundPrice(symbol, price);
+  const params = { symbol, side, type: 'LIMIT', quantity: qty, price: p, timeInForce: 'GTX' };
+  return signedRequest('POST', '/fapi/v1/order', params);
+}
+async function cancelOrder(symbol, orderId) {
+  try { return await signedRequest('DELETE', '/fapi/v1/order', { symbol, orderId }); }
+  catch (e) { return null; }
+}
+async function getOrder(symbol, orderId) {
+  try { return await signedRequest('GET', '/fapi/v1/order', { symbol, orderId }); }
+  catch (e) { return null; }
+}
+
+// Entrée maker-first : tente un post-only (frais maker), et si pas exécuté en
+// MAKER_WAIT_MS, on annule et on passe en market (taker). Renvoie 'maker'|'taker'|null.
+async function openWithMaker(symbol, side, qty, refPrice) {
+  if (!STRAT.USE_MAKER_ENTRY) {
+    await marketOrder(symbol, side, qty);
+    return 'taker';
+  }
+  // Prix limite en retrait (BUY sous le prix, SELL au-dessus) pour rester maker
+  const offset = STRAT.MAKER_OFFSET;
+  const limitPx = side === 'BUY' ? refPrice * (1 - offset) : refPrice * (1 + offset);
+  let order;
+  try {
+    order = await limitMakerOrder(symbol, side, qty, limitPx);
+  } catch (e) {
+    // post-only rejeté (serait taker) ou erreur -> fallback market direct
+    await marketOrder(symbol, side, qty);
+    return 'taker';
+  }
+  const orderId = order && order.orderId;
+  if (!orderId) { await marketOrder(symbol, side, qty); return 'taker'; }
+
+  // Attendre l'exécution du post-only
+  await new Promise((r) => setTimeout(r, STRAT.MAKER_WAIT_MS));
+  const st = await getOrder(symbol, orderId);
+  if (st && st.status === 'FILLED') return 'maker';
+
+  // Pas (entièrement) rempli -> on annule et on bascule en market
+  await cancelOrder(symbol, orderId);
+  const partial = st && parseFloat(st.executedQty || 0) > 0;
+  if (partial) {
+    const remaining = roundQty(symbol, qty - parseFloat(st.executedQty));
+    if (remaining > 0) await marketOrder(symbol, side, remaining);
+    return 'maker'; // majorité en maker
+  }
+  await marketOrder(symbol, side, qty);
+  return 'taker';
 }
 async function fetchPosition(symbol) {
   try {
@@ -612,8 +689,9 @@ async function tryOpen(symbol, signal) {
   const before = await fetchPosition(symbol);
   const beforeQty = before ? before.qty : 0;
 
+  let entryFill = 'taker';
   try {
-    await marketOrder(symbol, signal.side, qty);
+    entryFill = await openWithMaker(symbol, signal.side, qty, S.price);
   } catch (e) {
     if (e.binanceCode === -1007) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -635,6 +713,7 @@ async function tryOpen(symbol, signal) {
   S.position = {
     side: signal.side, entry, qty, stake, lev, quality: signal.quality,
     isExceptional, excConditions: signal.excConditions || 0,
+    entryFill, // 'maker' ou 'taker' : sert au calcul des frais d'entrée
     slPct: exits.slPct, tpPct: exits.tpPct, exitSource: exits.source,
     sl: signal.side === 'BUY' ? entry * (1 - exits.slPct) : entry * (1 + exits.slPct),
     tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
@@ -645,7 +724,6 @@ async function tryOpen(symbol, signal) {
   if (viaRelaxed) state.lastRelaxedExcAt = now; // limite : 1 mise 9% via 3/4 par fenêtre
   const tag = isExceptional ? (viaRelaxed ? ' 💎MISE-EXC-9%(3/4)' : ' 💎MISE-EXC-9%(4/4)') : '';
   logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality} (${signal.excConditions || 0}/4) SL-${(exits.slPct*100).toFixed(2)}%/TP+${(exits.tpPct*100).toFixed(2)}%[${exits.source}]${tag}`);
-  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} lev=${lev}x Q=${signal.quality} (${signal.excConditions || 0}/4)${tag}`);
   broadcast({ type: 'positions', positions: livePositions() });
 }
 
@@ -671,7 +749,10 @@ async function closePos(symbol, reason) {
   const dir = pos.side === 'BUY' ? 1 : -1;
   const pnlPct = ((exit - pos.entry) / pos.entry) * dir;
   const gross = pnlPct * pos.stake * pos.lev;
-  const fees = pos.stake * pos.lev * STRAT.FEE_PER_SIDE * 2;
+  // Frais : leg d'entrée maker (0.02%) si l'ordre est passé en post-only, sinon taker.
+  // Leg de sortie toujours taker (fermeture au market).
+  const entryFeeRate = pos.entryFill === 'maker' ? STRAT.FEE_MAKER : STRAT.FEE_PER_SIDE;
+  const fees = pos.stake * pos.lev * (entryFeeRate + STRAT.FEE_PER_SIDE);
   const net = gross - fees;
 
   state.capital += net;
@@ -724,11 +805,11 @@ function managePosition(symbol) {
   // Profit NET de frais, exprimé en fraction de la MISE (pas du prix).
   // net = (mouvement_prix x levier) - frais_aller_retour ; frais = 0.08% x levier.
   const grossOnStake = pnlPct * pos.lev;
-  const feeOnStake = STRAT.FEE_PER_SIDE * 2 * pos.lev;
+  const entryFeeRate = pos.entryFill === 'maker' ? STRAT.FEE_MAKER : STRAT.FEE_PER_SIDE;
+  const feeOnStake = (entryFeeRate + STRAT.FEE_PER_SIDE) * pos.lev;
   const netOnStake = grossOnStake - feeOnStake;
 
-  // Le trailing s'arme quand le profit NET atteint +0.5% de la mise (et pas avant :
-  // ainsi le gain verrouillé est toujours positif APRÈS frais Binance).
+  // Le trailing s'arme dès +0.3% NET (sécurise tôt, gain toujours positif après frais).
   if (!pos.trailing && netOnStake >= STRAT.NET_PROFIT_ARM) pos.trailing = true;
 
   // Niveau SL propre à CETTE position (fixe -1% ici)
@@ -737,12 +818,12 @@ function managePosition(symbol) {
   // --- Sorties (priorité absolue) : SL fixe, puis trailing une fois armé ---
   // Pas de TP plafond : le trade court tant que le trailing tient.
   if (pos.trailing) {
-    // Le trailing suit en valeur NETTE (sur la mise), pas en prix brut — sinon à fort
-    // levier un petit recul de prix effacerait le gain. On mémorise le pic de net,
-    // et on sort si le net redescend de TRAIL_PCT sous ce pic, MAIS jamais sous +0.5% net.
+    // Trailing en valeur NETTE (sur la mise). On mémorise le pic de net.
     if (pos.netPeak == null || netOnStake > pos.netPeak) pos.netPeak = netOnStake;
     const netDraw = pos.netPeak - netOnStake; // recul du net depuis son pic
-    const floor = STRAT.NET_PROFIT_ARM; // plancher : on ne rend jamais le +0.5% net acquis
+    // Plancher progressif : +0.3% de base, puis +0.6% dès que le pic a dépassé +0.6%
+    // (une fois le trade bien en profit, on ne le laisse jamais retomber sous +0.6% net).
+    const floor = pos.netPeak >= STRAT.NET_PROFIT_LOCK ? STRAT.NET_PROFIT_LOCK : STRAT.NET_PROFIT_ARM;
     if (netDraw >= STRAT.TRAIL_PCT || netOnStake <= floor) {
       closePos(symbol, 'TRAILING'); return;
     }
@@ -751,7 +832,7 @@ function managePosition(symbol) {
   }
 
   // --- Fenêtre intermédiaire : DÉSACTIVÉE (TIME_EXIT_INTERMEDIATE=false) ---
-  // Seul le filet ultime 14 min ferme par le temps ; sinon SL ou trailing.
+  // Seul le filet ultime 20 min ferme par le temps ; sinon SL ou trailing net.
   if (STRAT.TIME_EXIT_INTERMEDIATE && age >= STRAT.TIME_EXIT_FROM && age < STRAT.TIME_EXIT_HARD) {
     if (pnlPct > 0) {
       const giveback = pos.side === 'BUY' ? (pos.peak - px) / pos.peak : (px - pos.peak) / pos.peak;
@@ -999,10 +1080,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.4 - 280 - x2 x11 - mise 90/280 <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">Stratégie 2,5:1 · 20 cryptos</div>
+  <div class="sub" id="stratline">3.4 · mise 90-280$ · levier x2-x11 · maker · 10 trades · 15min</div>
 
   <div class="controls">
     <button id="start" class="btn-go">▶ Démarrer</button>
@@ -1058,7 +1140,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='Stratégie · SL -'+(s.strat?s.strat.sl:1)+'% · trailing net +0.5% · Q≥53 · levier 5-20x · 4 trades · 280$/trade';
+    $('stratline').textContent='3.4 · SL -'+(s.strat?s.strat.sl:1)+'% · trailing net +0.3%→+0.6% · Q≥60 · levier x2-x11 · maker · mise 90-280$ · 10 trades';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1160,7 +1242,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // ==================================================================
 async function start() {
   logLine(`🚀 Itachi Multi — ${MODE.toUpperCase()} — ${ALL_SYMBOLS.length} symboles — capital $${CAPITAL_START}`);
-  logLine(`📐 SL -${STRAT.SL_PCT * 100}% — trailing armé +0.5% NET de frais, suit -${STRAT.TRAIL_PCT*100}% — Q>=${STRAT.Q_MIN_CALM} — levier 5-20x — 4 trades — ${STRAT.FIXED_STAKE_USD}$/trade — max 20min — kill -45%`);
+  logLine(`📐 SERVEUR 3.4 — SL -${STRAT.SL_PCT * 100}% — trailing net arme +${STRAT.NET_PROFIT_ARM*100}%, verrou +${STRAT.NET_PROFIT_LOCK*100}%, suit -${STRAT.TRAIL_PCT*100}% — Q>=${STRAT.Q_MIN_CALM} — levier x2-x11 — mise 90-280$ selon conditions — entrée MAKER (${STRAT.FEE_MAKER*100}%) — 10 trades — max 15min — kill -45%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
   await refreshAllKlines();
