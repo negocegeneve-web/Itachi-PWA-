@@ -1,39 +1,30 @@
 /* ============================================================
- *  SERVEUR 3.5 - TRADE 1J   (swing mean-reversion 1h/2h)
+ *  SERVEUR 3.6 - TRADE 1J   (swing mean-reversion + correctifs)
  *  ------------------------------------------------------------
- *  Première architecture où les INDICATEURS sont accordés à
- *  l'horizon de détention (positions tenues jusqu'à 24h).
- *  À cet horizon, les frais deviennent négligeables et le
- *  FUNDING RATE devient un signal de retournement exploitable.
+ *  Base 3.5, avec 3 apports majeurs :
  *
- *  ANALYSE : bougies 1h (signal) + 2h (confirmation de régime).
- *   (Binance ne fournit pas de bougies 1h30 nativement ; 2h est
- *    le plus proche natif de l'intention "1h-1h30".)
+ *  1. CORRECTIF BUG -4005 "Quantity greater than max quantity" :
+ *     - À l'ouverture : la quantité est plafonnée au maxQty du
+ *       filtre MARKET_LOT_SIZE ; les tokens trop bon marché pour
+ *       la mise (couverture <50%) sont écartés.
+ *     - À la fermeture : DÉCOUPAGE automatique en plusieurs ordres
+ *       <= maxQty (garde-fou 20 tranches). Débloque les positions
+ *       coincées (ex. NFPUSDT à +24% impossible à fermer).
  *
- *  STRATÉGIE : mean-reversion sur extrêmes de range.
- *   - Bollinger 20/2σ (1h) + RSI 14 (<30 / >70)
- *   - Filtre régime : ADX 2h < 30 (pas de tendance écrasante)
- *   - Filtre volatilité : ATR 1h >= 0.4% + confirmation volume
- *   - FUNDING (souple) : funding extrême aligné au sens du trade
- *     bonifie le score (short squeeze / correction) ; sinon malus.
- *     N'INTERDIT jamais un trade, ajuste seulement la qualité.
+ *  2. SCALING OUT (prise de profit partielle, on laisse courir) :
+ *     - +10% -> ferme 34%   |   +20% -> ferme 50% du reste
+ *     - le solde court sur le trailing large (capture les +20-35%).
+ *     NB : optimise la CAPTURE des gros gains, ne les garantit pas
+ *     (le marché seul décide qu'un trade atteigne +20-30%).
  *
- *  SORTIES (trailing LARGE, on laisse courir vers 1-4%) :
- *   - SL fixe -2.5%
- *   - Trailing armé à +1%, suiveur -1.5% du pic
- *   - Borne haute de sécurité +6% ; time-stop 24h
+ *  3. FILTRES ASSOUPLIS "de très peu" (plus de trades, sans casser
+ *     la sélectivité) : RSI 30/70 -> 35/65, ADX régime 30 -> 35.
+ *     (Reste un bot SWING : quelques trades/jour, pas 5-8/heure —
+ *      c'est structurel. Pour la haute fréquence : Serveur 5.0.)
  *
- *  UNIVERS DYNAMIQUE : scan des perpétuels USDT Binance, classés
- *  par amplitude 24h (les plus VOLATILS), volume >= 50M$, top 20.
- *  Re-scan chaque heure ; le flux de prix se reconnecte au besoin.
- *
- *  RISQUE : levier x2->x5 (selon Q), mise 80-280$ (selon Q),
- *  20 positions max, exposition <=300%, cooldown 1h après stop,
- *  coupe-circuit 5 pertes, kill -25%.
- *
- *  ⚠️ Testnet : univers/funding réels viennent du MAINNET (klines),
- *  mais l'exécution testnet reste artificiellement calme. Le juge
- *  final de la rentabilité reste un backtest sur données réelles.
+ *  Conserve : MR 1h/2h (Bollinger+RSI), funding souple, univers
+ *  volatil dynamique (top 20), SL -2.5%, trailing +1%/-1.5%,
+ *  levier x2-x5, mise 80-280$, time-stop 24h, kill -25%.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -92,13 +83,13 @@ const STRAT = {
   BB_PERIOD: 20,        // Bandes de Bollinger 20 periodes (1h)
   BB_STDDEV: 2.0,       // 2 ecarts-types
   RSI_PERIOD: 14,       // RSI 14 (standard, adapte au swing)
-  RSI_OVERSOLD: 30,     // survente -> LONG (rebond)
-  RSI_OVERBOUGHT: 70,   // surachat -> SHORT (retour)
+  RSI_OVERSOLD: 35,     // survente -> LONG (assoupli 30->35 : un peu plus d'entrées)
+  RSI_OVERBOUGHT: 65,   // surachat -> SHORT (assoupli 70->65)
   ATR_PERIOD: 14,       // ATR 1h (volatilite, calibrage sorties)
 
   // --- Filtre de regime : ADX sur 4h ---
   ADX_PERIOD: 14,
-  ADX_RANGE_MAX: 30,    // ADX 2h < 30 = pas de tendance ecrasante -> mean-reversion OK
+  ADX_RANGE_MAX: 35,    // ADX 2h < 35 (assoupli 30->35 : accepte marchés un peu plus directionnels)
 
   // --- Filtre FUNDING (souple) : ajuste le score, ne bloque pas ---
   //  Funding tres positif = trop de longs -> bonus aux SHORT, malus aux LONG.
@@ -115,8 +106,15 @@ const STRAT = {
   SL_PCT: 0.025,        // -2.5% stop-loss (marge pour l'horizon 1j)
   TRAIL_ARM: 0.010,     // trailing s'arme a +1.0%
   TRAIL_PCT: 0.015,     // suiveur -1.5% du pic (LARGE : laisse courir vers 2-4%)
-  TP_SOFT_CAP: 0.06,    // borne haute indicative +6% (securite, rarement atteinte)
+  TP_SOFT_CAP: 0.35,    // borne haute indicative +35% (securite, rarement atteinte)
   TIME_STOP_MS: 86400000, // time-stop 24h (1 jour)
+
+  // --- SCALING OUT : prise de profit PARTIELLE, on laisse courir le reste ---
+  SCALE_OUT: [
+    { at: 0.10, frac: 0.34 }, // a +10% : ferme 34% de la position
+    { at: 0.20, frac: 0.50 }, // a +20% : ferme 50% du RESTE
+    // le solde court sur le trailing large (capture les +20-35% comme NFPUSDT)
+  ],
 
   // --- Frais & execution ---
   FEE_MAKER: 0.0002, FEE_TAKER: 0.0005,
@@ -267,10 +265,18 @@ async function loadSymbolInfo() {
     for (const sym of info.symbols) {
       if (sym.symbol && sym.symbol.endsWith('USDT')) {
         const lot = sym.filters.find((f) => f.filterType === 'LOT_SIZE');
+        // MARKET_LOT_SIZE borne la quantité d'un ordre MARKET (souvent < LOT_SIZE).
+        const mlot = sym.filters.find((f) => f.filterType === 'MARKET_LOT_SIZE');
+        // On prend la borne la plus restrictive entre les deux filtres.
+        const maxLot = lot ? parseFloat(lot.maxQty) : Infinity;
+        const maxMarket = mlot ? parseFloat(mlot.maxQty) : Infinity;
+        const minLot = lot ? parseFloat(lot.minQty) : 0;
         SYMBOL_INFO[sym.symbol] = {
           qtyPrecision: sym.quantityPrecision,
           pricePrecision: sym.pricePrecision,
           stepSize: lot ? parseFloat(lot.stepSize) : 0.001,
+          maxQty: Math.min(maxLot, maxMarket), // borne dure par ordre
+          minQty: minLot,
         };
       }
     }
@@ -283,6 +289,36 @@ async function loadSymbolInfo() {
 function roundQty(symbol, q) {
   const p = SYMBOL_INFO[symbol] ? SYMBOL_INFO[symbol].qtyPrecision : 3;
   return parseFloat(q.toFixed(p));
+}
+function maxQtyFor(symbol) {
+  const info = SYMBOL_INFO[symbol];
+  return info && isFinite(info.maxQty) ? info.maxQty : Infinity;
+}
+function minQtyFor(symbol) {
+  const info = SYMBOL_INFO[symbol];
+  return info ? info.minQty : 0;
+}
+
+// Ferme une quantité donnée en la DÉCOUPANT en plusieurs ordres MARKET reduceOnly
+// si elle dépasse le maxQty autorisé par Binance (corrige le -4005). Garde-fou anti-boucle.
+async function closeQtyInChunks(symbol, closeSide, totalQty) {
+  const maxQ = maxQtyFor(symbol);
+  let remaining = totalQty;
+  let guard = 0;
+  const MAX_CHUNKS = 20; // anti-boucle : jamais plus de 20 ordres
+  while (remaining > 0 && guard < MAX_CHUNKS) {
+    guard++;
+    let chunk = isFinite(maxQ) ? Math.min(remaining, maxQ) : remaining;
+    chunk = roundQty(symbol, chunk);
+    if (chunk <= 0) break;
+    await marketOrder(symbol, closeSide, chunk, true);
+    remaining = roundQty(symbol, remaining - chunk);
+  }
+  if (remaining > 0) {
+    logLine(`⚠️ ${symbol} : fermeture partielle (reste ${remaining} après ${guard} tranches).`);
+    return false;
+  }
+  return true;
 }
 function roundPrice(symbol, price) {
   const p = SYMBOL_INFO[symbol] && SYMBOL_INFO[symbol].pricePrecision != null ? SYMBOL_INFO[symbol].pricePrecision : 4;
@@ -653,8 +689,21 @@ async function tryOpen(symbol, signal) {
   if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) return;
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
-  const qty = roundQty(symbol, (stake * lev) / S.price);
+  let qty = roundQty(symbol, (stake * lev) / S.price);
   if (qty <= 0) return;
+  // Garde-fou -4005 : si la quantité dépasse le max autorisé par ordre, on plafonne.
+  // Si même le max autorisé représente une part dérisoire de la mise voulue, on skip
+  // (token trop bon marché pour notre taille : source de trades ingérables).
+  const maxQ = maxQtyFor(symbol);
+  if (isFinite(maxQ) && qty > maxQ) {
+    const coverage = (maxQ * S.price) / (stake * lev); // fraction de la mise réellement plaçable
+    if (coverage < 0.5) {
+      logLine(`⏭️ ${symbol} @ ${S.price} : quantité voulue ${qty} > max ${maxQ} (couvre ${(coverage*100).toFixed(0)}%) — skip (token trop bon marché pour la mise).`);
+      return;
+    }
+    qty = roundQty(symbol, maxQ); // sinon on plafonne au max plaçable
+  }
+  if (qty < minQtyFor(symbol)) return;
 
   await setLeverage(symbol, lev);
 
@@ -674,7 +723,7 @@ async function tryOpen(symbol, signal) {
     entryFill, slPct: exits.slPct, tpPct: exits.tpPct,
     sl: signal.side === 'BUY' ? entry * (1 - exits.slPct) : entry * (1 + exits.slPct),
     tp: signal.side === 'BUY' ? entry * (1 + exits.tpPct) : entry * (1 - exits.tpPct),
-    openedAt: now, peakPnl: 0,
+    openedAt: now, peakPnl: 0, scaleDone: [],
   };
   S.lastEntryAt = now;
   const f = S.swing.funding != null ? ` funding=${(S.swing.funding*100).toFixed(3)}%` : '';
@@ -682,13 +731,18 @@ async function tryOpen(symbol, signal) {
   broadcast({ type: 'positions', positions: livePositions() });
 }
 
-async function closePos(symbol, reason) {
+async function closePos(symbol, reason, qtyToClose = null) {
   const S = state.sym[symbol];
   const pos = S.position;
   if (!pos) return;
   const closeSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
+  // Quantité à fermer : tout par défaut, ou une part (scaling out).
+  const qty = qtyToClose != null ? roundQty(symbol, qtyToClose) : pos.qty;
+  if (qty <= 0) return;
   try {
-    await marketOrder(symbol, closeSide, pos.qty, true);
+    // Fermeture DÉCOUPÉE en tranches <= maxQty (corrige l'erreur -4005).
+    const ok = await closeQtyInChunks(symbol, closeSide, qty);
+    if (!ok) { logLine(`↩️ ${symbol} : fermeture incomplète, réessai au prochain tick.`); return; }
   } catch (e) {
     if (e.binanceCode === -1007) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -698,6 +752,23 @@ async function closePos(symbol, reason) {
       logLine(`❌ ${symbol} fermeture: ${e.message}`);
       return;
     }
+  }
+
+  // --- SCALING OUT : fermeture PARTIELLE (on garde le reste ouvert) ---
+  if (qtyToClose != null && qty < pos.qty) {
+    const exitPx = S.price;
+    const dir = pos.side === 'BUY' ? 1 : -1;
+    const pnlPct = ((exitPx - pos.entry) / pos.entry) * dir;
+    const gross = pnlPct * (qty / pos.qty) * pos.stake * pos.lev;
+    const fees = (qty / pos.qty) * pos.stake * pos.lev * (STRAT.FEE_MAKER + STRAT.FEE_TAKER);
+    const net = gross - fees;
+    state.capital += net;
+    state.stats.gross += gross; state.stats.fees += fees; state.stats.net += net;
+    pos.qty = roundQty(symbol, pos.qty - qty);      // réduit la position restante
+    pos.stake = pos.stake * (pos.qty / (pos.qty + qty)); // ajuste la mise résiduelle
+    logLine(`💰 ${symbol} PRISE PARTIELLE ${reason} : ${(pnlPct*100).toFixed(1)}% sur ${qty} — net ${net.toFixed(2)}$ — reste ${pos.qty}.`);
+    broadcast({ type: 'positions', positions: livePositions() });
+    return;
   }
 
   const exit = S.price;
@@ -761,13 +832,27 @@ function managePosition(symbol) {
 
   // 1) Stop-loss fixe -2.5%
   if (pnlPct <= -pos.slPct) { closePos(symbol, 'STOP-LOSS'); return; }
-  // 2) Trailing LARGE : armé à +1%, sort si on recule de 1.5% sous le pic (laisse courir vers 2-4%)
+
+  // 2) SCALING OUT : prise de profit partielle aux paliers, on garde le reste.
+  if (STRAT.SCALE_OUT && !pos.scaleDone) pos.scaleDone = [];
+  if (STRAT.SCALE_OUT) {
+    for (let i = 0; i < STRAT.SCALE_OUT.length; i++) {
+      const step = STRAT.SCALE_OUT[i];
+      if (!pos.scaleDone.includes(i) && pnlPct >= step.at && pos.qty > 0) {
+        pos.scaleDone.push(i);
+        const chunk = roundQty(symbol, pos.qty * step.frac);
+        if (chunk > 0 && chunk < pos.qty) { closePos(symbol, `SCALE+${(step.at*100).toFixed(0)}%`, chunk); return; }
+      }
+    }
+  }
+
+  // 3) Trailing LARGE : armé à +1%, sort si on recule de 1.5% sous le pic (laisse courir)
   if (pos.peakPnl >= STRAT.TRAIL_ARM) {
     if (pos.peakPnl - pnlPct >= STRAT.TRAIL_PCT) { closePos(symbol, 'TRAILING'); return; }
   }
-  // 3) Borne haute de sécurité (rarement atteinte)
+  // 4) Borne haute de sécurité (rarement atteinte)
   if (pnlPct >= STRAT.TP_SOFT_CAP) { closePos(symbol, 'TAKE-PROFIT'); return; }
-  // 4) Time-stop 24h
+  // 5) Time-stop 24h
   if (age >= STRAT.TIME_STOP_MS) { closePos(symbol, 'TIME-STOP-24H'); return; }
 }
 
@@ -1017,11 +1102,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.5 - trade 1j <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.6 - trade 1j <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.5 trade 1j · swing mean-reversion 1h/2h · funding · univers volatil dynamique</div>
+  <div class="sub" id="stratline">3.6 trade 1j · MR 1h/2h · scaling out · funding · univers volatil dynamique</div>
 
   <div class="controls">
     <button id="start" class="btn-go">▶ Démarrer</button>
@@ -1077,7 +1162,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='3.5 trade 1j · MR 1h/2h · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing large +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · x2-5 · '+(s.strat?s.strat.universe:20)+' cryptos volatiles';
+    $('stratline').textContent='3.6 trade 1j · MR 1h/2h · scaling out 10/20% · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing large +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · x2-5 · '+(s.strat?s.strat.universe:20)+' cryptos volatiles';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1177,7 +1262,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`🚀 Itachi — SERVEUR 3.5 TRADE 1J — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`🚀 Itachi — SERVEUR 3.6 TRADE 1J — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
   logLine(`📐 Swing mean-reversion 1h/2h — Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}σ + RSI${STRAT.RSI_PERIOD} (${STRAT.RSI_OVERSOLD}/${STRAT.RSI_OVERBOUGHT}) — régime ADX2h<${STRAT.ADX_RANGE_MAX} — funding souple — SL -${STRAT.SL_PCT*100}% / trailing large armé +${STRAT.TRAIL_ARM*100}% suit -${STRAT.TRAIL_PCT*100}% — levier x2-x5 — mise ${STRAT.STAKE_MIN_USD}-${STRAT.STAKE_MAX_USD}$ — ${STRAT.MAX_POSITIONS_CAP} pos — time-stop 24h — kill -${STRAT.KILL_PCT*100}%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
