@@ -1,35 +1,28 @@
 /* ============================================================
- *  SERVEUR 3.7 - TRADE 1J   (multi-régime, réconciliation, chrono)
+ *  SERVEUR 3.8 - 1J - MAJ   (35 symboles noyau fixe + anti-ban)
  *  ------------------------------------------------------------
- *  Base 3.6, avec 3 correctifs majeurs demandés :
+ *  UNIVERS = 35 : NOYAU FIXE de 5 (BTC, ETH, BNB, SOL, DOGE,
+ *  toujours présents, jamais évincés par le scan) + 30 perpétuels
+ *  USDT les plus VOLATILS (volume >= 50M$), re-scannés chaque heure.
+ *  Choix de 35 (vs 45) : au-delà, la "volatilité" vient surtout de
+ *  l'illiquidité (slippage, faux signaux) -> on écarte le bruit.
+ *  Le noyau ancre l'univers sur des actifs liquides qui portent le
+ *  régime de marché ; la couche volatile va chercher l'opportunité.
  *
- *  1. RÉCONCILIATION BIDIRECTIONNELLE (correctif critique) :
- *     reconcile() interroge TOUTES les positions réelles du compte
- *     (/fapi/v2/positionRisk sans filtre) à chaque cycle (9s) et :
- *       - nettoie les positions fantômes (fermées côté Binance) ;
- *       - ADOPTE les positions orphelines que l'état interne ignorait
- *         (le bug qui faisait voir 1 position sur 8) pour les gérer
- *         (stop, trailing, scaling out) et les afficher.
- *     Un symbole en position hors univers est ré-ajouté au flux prix.
- *     "Binance = source de vérité" enfin réellement appliqué.
+ *  PROTECTIONS ANTI-BAN Binance (indispensables en multi-symboles) :
+ *   - Moniteur de poids : lit X-MBX-USED-WEIGHT-1M à chaque réponse.
+ *     À 80% du budget (2400/min USD-M), temporise ; sur 418/429/-1003,
+ *     met le bot en PAUSE de sécurité 60s (évite le ban 2min->3j).
+ *   - Fetch étalé : lots de 5 + micro-pause (lisse le pic de démarrage).
+ *   - Aucun ordre ni cycle klines pendant une pause rate-limit.
+ *   Charge estimée en régime : ~220/2400 poids/min (~9%). Large marge.
  *
- *  2. CHRONO PAR TRADE : durée live sur chaque position (rouge à
- *     l'approche du time-stop 24h) + colonne durée dans l'historique.
- *     Marqueur "adopté" sur les positions reprises par réconciliation.
- *
- *  3. MULTI-RÉGIME "JOUER LA TENDANCE" (jamais de pause) :
- *     Le régime est déduit de l'ADX 2h ET de sa direction (DI+/DI-) :
- *       - RANGE (ADX bas)      -> mean-reversion 2 sens (fade extrêmes)
- *       - UP   (ADX haut, DI+) -> QUE des LONG, sur repli (buy the dip)
- *       - DOWN (ADX haut, DI-) -> QUE des SHORT, sur rebond (sell rally)
- *     Le bot ne s'abstient jamais : il s'ALIGNE sur la direction
- *     dominante au lieu de contrarier. (En marché baissier actuel,
- *     il short les rebonds — ce qui rend les positions gagnantes.)
- *     Bonus de score pour l'alignement tendance ; funding souple gardé.
- *
- *  Conserve : univers volatil dynamique, scaling out (+10%/+20%),
- *  fermeture en tranches (fix -4005), SL -2.5%, trailing +1%/-1.5%,
- *  levier x2-x5, mise 80-280$, time-stop 24h, kill -25%.
+ *  Conserve tout le 3.8 : jusqu'à 25 positions, rotation de capital
+ *  (mini-perte + essoufflé 30min + signal Q>=68, 1/symbole/30min),
+ *  clôture manuelle (totale/partielle), assouplissement RANGE
+ *  togglable, réconciliation (adoption), chrono, multi-régime par
+ *  symbole (RANGE/UP/DOWN, jamais de pause), scaling out, SL -2.5%,
+ *  trailing +1%/-1.5%, levier x2-x5, mise 80-280$, kill -25%.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -90,6 +83,13 @@ const STRAT = {
   RSI_PERIOD: 14,       // RSI 14 (standard, adapte au swing)
   RSI_OVERSOLD: 35,     // survente -> LONG (assoupli 30->35 : un peu plus d'entrées)
   RSI_OVERBOUGHT: 65,   // surachat -> SHORT (assoupli 70->65)
+
+  // --- Assouplissement d'entrée en RANGE (activable/désactivable à chaud) ---
+  // Si activé : en RANGE, on entre si la bande est touchée OU si le RSI est TRÈS extrême
+  // (sans exiger le franchissement de la bande). Capture les cas type MUSDT (RSI 79).
+  RELAX_RANGE_ENTRY: true, // état par défaut (basculable via le bouton du dashboard)
+  RSI_EXTREME_LOW: 25,     // RSI <= 25 -> LONG autorisé même sans toucher la bande basse
+  RSI_EXTREME_HIGH: 75,    // RSI >= 75 -> SHORT autorisé même sans toucher la bande haute
   ATR_PERIOD: 14,       // ATR 1h (volatilite, calibrage sorties)
 
   // --- Filtre de regime : ADX sur 4h ---
@@ -140,15 +140,26 @@ const STRAT = {
   Q_FOR_MAX_STAKE: 80,  // Q>=80 -> mise max 280$ ; interpolation lineaire depuis 80$
 
   // --- Positions & risque ---
-  MAX_POSITIONS_CAP: 20, // jusqu'a 20 positions simultanees
-  MAX_EXPOSURE_PCT: 3.0, // exposition totale plafonnee a 300% du capital (garde-fou)
+  MAX_POSITIONS_CAP: 25, // jusqu'a 25 positions simultanees
+  MAX_EXPOSURE_PCT: 6.0, // exposition relevee a 600% (25 pos x mise x levier) - garde-fou
+
+  // --- ROTATION DE CAPITAL : fermer un mini-perdant essouffle pour liberer un slot EXCELLENT ---
+  // Ne se declenche QUE si tous les slots sont pleins ET qu'un signal Q>=seuil attend.
+  ROTATION_ENABLED: true,
+  ROTATION_MAX_LOSS: 0.005,     // le trade a fermer doit etre entre 0 et -0.5% (mini-perte)
+  ROTATION_MIN_AGE_MS: 1800000, // ...et ouvert depuis >= 30 min
+  ROTATION_STALE_PEAK: 0.005,   // ...et n'avoir JAMAIS depasse +0.5% (essouffle, ne travaille pas)
+  ROTATION_MIN_Q: 68,           // le signal candidat doit avoir une qualite Q >= 68 (excellent)
+  ROTATION_COOLDOWN_MS: 1800000,// 1 rotation par symbole / 30 min max (anti-emballement frais)
   KILL_PCT: 0.25,        // kill switch -25%
   MAX_CONSEC_LOSSES: 5,  // coupe-circuit apres 5 pertes consecutives
   COOLDOWN_AFTER_STOP_MS: 3600000, // cooldown 1h sur un symbole apres un stop
 
   // --- Univers dynamique : cryptos les plus volatiles de Binance ---
   DYNAMIC_UNIVERSE: true,
-  UNIVERSE_SIZE: 20,        // on trade les 20 perpetuels USDT les plus volatils
+  UNIVERSE_SIZE: 35,        // 35 au total = 5 fixes (noyau) + 30 volatils dynamiques
+  CORE_SYMBOLS: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'DOGEUSDT'], // noyau TOUJOURS présent
+  DYNAMIC_SIZE: 30,         // nb de volatils dynamiques (hors noyau)
   UNIVERSE_REFRESH_MS: 3600000, // re-scan de l'univers toutes les heures
   UNIVERSE_MIN_VOL_USDT: 50000000, // volume 24h minimum 50M$ (liquidite)
 
@@ -212,6 +223,23 @@ function sign(query) {
   return crypto.createHmac('sha256', API_SECRET).update(query).digest('hex');
 }
 
+// ==================================================================
+// MONITEUR DE POIDS API (anti-ban Binance)
+// Lit l'en-tête X-MBX-USED-WEIGHT-1M renvoyé par Binance à chaque réponse.
+// Limite par défaut USD-M : 2400/min. On met le bot en pause auto à 80%.
+// ==================================================================
+const WEIGHT = { used: 0, limit: 2400, threshold: 0.80, pausedForWeight: false, lastSeen: 0 };
+function trackWeight(res) {
+  try {
+    const w = res.headers && res.headers.get && res.headers.get('X-MBX-USED-WEIGHT-1M');
+    if (w != null) { WEIGHT.used = parseInt(w, 10) || WEIGHT.used; WEIGHT.lastSeen = Date.now(); }
+  } catch (e) { /* ignore */ }
+}
+// À appeler avant les cycles lourds : renvoie true s'il faut temporiser.
+function weightSaturated() {
+  return WEIGHT.used >= WEIGHT.limit * WEIGHT.threshold;
+}
+
 async function signedRequest(method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
@@ -221,10 +249,17 @@ async function signedRequest(method, path, params = {}) {
   const timer = setTimeout(() => controller.abort(), 8000);
   try {
     const res = await fetch(url, { method, headers: { 'X-MBX-APIKEY': API_KEY }, signal: controller.signal });
+    trackWeight(res);
     const data = await res.json();
     if (!res.ok) {
       const err = new Error(`Binance ${res.status}: ${JSON.stringify(data)}`);
       err.binanceCode = data && data.code;
+      // Ban de poids (-1003) ou 418/429 : on met le bot en pause de sécurité.
+      if (res.status === 418 || res.status === 429 || (data && data.code === -1003)) {
+        WEIGHT.pausedForWeight = true;
+        logLine(`🛑 RATE-LIMIT Binance (${res.status}) — pause de sécurité 60s pour éviter le ban.`);
+        setTimeout(() => { WEIGHT.pausedForWeight = false; logLine('✅ Reprise après pause rate-limit.'); }, 60000);
+      }
       throw err;
     }
     return data;
@@ -249,6 +284,7 @@ async function publicGet(base, path, params = {}, retries = 2) {
     try {
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timer);
+      trackWeight(res);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -432,29 +468,33 @@ async function scanUniverse() {
   try {
     const tickers = await publicGet(REST_BASE, '/fapi/v1/ticker/24hr');
     if (!Array.isArray(tickers)) throw new Error('réponse inattendue');
+    const core = STRAT.CORE_SYMBOLS;
     const scored = tickers
-      .filter((t) => t.symbol && t.symbol.endsWith('USDT')) // perpétuels USDT
-      .filter((t) => !/(UPUSDT|DOWNUSDT|BULLUSDT|BEARUSDT)$/.test(t.symbol)) // pas de tokens à effet de levier
+      .filter((t) => t.symbol && t.symbol.endsWith('USDT'))
+      .filter((t) => !/(UPUSDT|DOWNUSDT|BULLUSDT|BEARUSDT)$/.test(t.symbol))
+      .filter((t) => !core.includes(t.symbol)) // le noyau est ajouté à part, pas de doublon
       .map((t) => {
         const high = parseFloat(t.highPrice), low = parseFloat(t.lowPrice);
-        const quoteVol = parseFloat(t.quoteVolume); // volume en USDT
-        const amplitude = low > 0 ? (high - low) / low : 0; // volatilité 24h
+        const quoteVol = parseFloat(t.quoteVolume);
+        const amplitude = low > 0 ? (high - low) / low : 0;
         return { symbol: t.symbol, amplitude, quoteVol };
       })
-      .filter((t) => t.quoteVol >= STRAT.UNIVERSE_MIN_VOL_USDT) // liquidité suffisante
-      .sort((a, b) => b.amplitude - a.amplitude); // les plus volatils d'abord
+      .filter((t) => t.quoteVol >= STRAT.UNIVERSE_MIN_VOL_USDT)
+      .sort((a, b) => b.amplitude - a.amplitude);
 
-    const top = scored.slice(0, STRAT.UNIVERSE_SIZE).map((t) => t.symbol);
+    const volatile = scored.slice(0, STRAT.DYNAMIC_SIZE).map((t) => t.symbol);
+    // Univers final = NOYAU FIXE (toujours) + volatils dynamiques.
+    const top = [...core, ...volatile];
     if (top.length === 0) throw new Error('aucun symbole après filtres');
 
-    // Toujours conserver les symboles déjà en position (pour les gérer jusqu'à la sortie).
+    // Conserver les symboles déjà en position (pour les gérer jusqu'à la sortie).
     for (const s of Object.keys(state.sym)) {
       if (state.sym[s].position && !top.includes(s)) top.push(s);
     }
     return top;
   } catch (e) {
-    logLine(`⚠️ scanUniverse: ${e.message} — repli sur liste statique`);
-    return FALLBACK_SYMBOLS.slice();
+    logLine(`⚠️ scanUniverse: ${e.message} — repli sur noyau + liste statique`);
+    return [...STRAT.CORE_SYMBOLS, ...FALLBACK_SYMBOLS.filter((s) => !STRAT.CORE_SYMBOLS.includes(s))];
   }
 }
 
@@ -540,8 +580,14 @@ function computeSignal(symbol) {
   // ================= LOGIQUE MULTI-RÉGIME (jamais de pause) =================
   if (sw.regime === 'RANGE') {
     // Mean-reversion : on fade les extrêmes, dans les deux sens.
+    // Base stricte : franchissement de bande + RSI en zone.
     if (belowLower && rsiLow) side = 'BUY';
     else if (aboveUpper && rsiHigh) side = 'SELL';
+    // Assouplissement (si activé) : RSI TRÈS extrême suffit, même sans toucher la bande.
+    else if (STRAT.RELAX_RANGE_ENTRY) {
+      if (sw.rsi <= STRAT.RSI_EXTREME_LOW && belowMid) side = 'BUY';
+      else if (sw.rsi >= STRAT.RSI_EXTREME_HIGH && aboveMid) side = 'SELL';
+    }
   } else if (sw.regime === 'UP') {
     // Tendance HAUSSIÈRE : on ne prend QUE des LONG, sur repli (buy the dip).
     // Entrée quand le prix corrige vers/sous la médiane sans être en survente extrême,
@@ -714,7 +760,41 @@ async function fetchPosition(symbol) {
 // ==================================================================
 // OUVERTURE / FERMETURE
 // ==================================================================
+// Cherche un trade "essoufflé" à fermer pour libérer un slot vers un signal excellent.
+// Triple condition CUMULÉE : mini-perte contenue + assez vieux + jamais progressé.
+// Renvoie le symbole victime (le PIRE candidat) ou null si aucun ne qualifie.
+function findRotationCandidate(exclude) {
+  const now = Date.now();
+  let worst = null, worstPnl = Infinity;
+  for (const s of Object.keys(state.sym)) {
+    if (s === exclude) continue;
+    const S = state.sym[s];
+    const pos = S.position;
+    if (!pos || pos.closingManual || pos.adopted) continue; // on ne rote pas les adoptées ni celles en clôture manuelle
+    // Cooldown anti-emballement
+    if (S.lastRotationAt && now - S.lastRotationAt < STRAT.ROTATION_COOLDOWN_MS) continue;
+    const px = S.price;
+    if (px <= 0) continue;
+    const dir = pos.side === 'BUY' ? 1 : -1;
+    const pnlPct = ((px - pos.entry) / pos.entry) * dir;
+    const age = now - (pos.openedAt || now);
+    const peak = pos.peakPnl != null ? pos.peakPnl : 0;
+    // 1) mini-perte : entre 0 et -ROTATION_MAX_LOSS
+    const miniLoss = pnlPct <= 0 && pnlPct >= -STRAT.ROTATION_MAX_LOSS;
+    // 2) assez vieux
+    const oldEnough = age >= STRAT.ROTATION_MIN_AGE_MS;
+    // 3) jamais progressé (n'a jamais dépassé le seuil de "vie")
+    const staled = peak < STRAT.ROTATION_STALE_PEAK;
+    if (miniLoss && oldEnough && staled) {
+      // On choisit le plus mauvais (pnl le plus bas) parmi les candidats.
+      if (pnlPct < worstPnl) { worstPnl = pnlPct; worst = s; }
+    }
+  }
+  return worst;
+}
+
 async function tryOpen(symbol, signal) {
+  if (WEIGHT.pausedForWeight) return; // pause de sécurité rate-limit : pas de nouvel ordre
   const S = state.sym[symbol];
   const now = Date.now();
   if (!S || S.position) return;
@@ -724,7 +804,21 @@ async function tryOpen(symbol, signal) {
   if (S.lastStopAt && now - S.lastStopAt < STRAT.COOLDOWN_AFTER_STOP_MS) return;
 
   const { stake, lev } = sizing(signal);
-  if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) return;
+  // Slots pleins : tenter une ROTATION si le signal est EXCELLENT (Q>=seuil).
+  if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) {
+    if (STRAT.ROTATION_ENABLED && signal.quality >= STRAT.ROTATION_MIN_Q) {
+      const victim = findRotationCandidate(symbol);
+      if (victim) {
+        logLine(`🔁 ROTATION : fermeture ${victim} (essoufflé) pour libérer un slot -> ${symbol} Q${signal.quality}.`);
+        state.sym[victim].lastRotationAt = Date.now();
+        await closePos(victim, 'ROTATION');
+      } else {
+        return; // aucun candidat à libérer -> on n'ouvre pas
+      }
+    } else {
+      return; // slots pleins et signal pas assez bon pour justifier une rotation
+    }
+  }
   if (currentExposure() + stake > state.capital * STRAT.MAX_EXPOSURE_PCT) return;
 
   let qty = roundQty(symbol, (stake * lev) / S.price);
@@ -935,6 +1029,7 @@ async function reconcile() {
     // 1) Positions FANTÔMES : l'état interne dit "ouvert", Binance dit "fermé" -> on nettoie.
     for (const symbol of Object.keys(state.sym)) {
       const S = state.sym[symbol];
+      if (S.position && S.position.closingManual) continue; // fermeture manuelle en cours : on ne touche pas
       if (S.position && !real[symbol]) {
         S.position = null;
         logLine(`🔄 ${symbol} : position fermée côté Binance — état nettoyé.`);
@@ -948,6 +1043,7 @@ async function reconcile() {
       ensureSymbolState(symbol);
       const S = state.sym[symbol];
       const r = real[symbol];
+      if (S.position && S.position.closingManual) continue; // fermeture manuelle en cours
       if (!S.position) {
         const exits = computeExits(symbol);
         // On estime la mise à partir de la marge réelle (qty*entry/levier).
@@ -1037,10 +1133,18 @@ async function refreshUniverse() {
 }
 
 async function refreshAllKlines() {
-  const BATCH = 4;
+  // Anti-ban : si Binance nous a mis en pause (418/429/-1003), on saute ce cycle.
+  if (WEIGHT.pausedForWeight) { logLine('⏳ Cycle klines sauté (pause rate-limit active).'); return; }
+  const BATCH = 5;
   for (let i = 0; i < ALL_SYMBOLS.length; i += BATCH) {
+    // Si on approche 80% du budget de poids, on temporise pour laisser l'intervalle se réinitialiser.
+    if (weightSaturated()) {
+      logLine(`⏳ Poids API à ${WEIGHT.used}/${WEIGHT.limit} — pause 5s pour éviter le ban.`);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
     const slice = ALL_SYMBOLS.slice(i, i + BATCH);
     await Promise.all(slice.map((s) => refreshKlines(s)));
+    await new Promise((r) => setTimeout(r, 120)); // micro-pause entre lots (lisse le pic)
   }
   rankActiveSymbols();
   broadcast({ type: 'snapshot', data: snapshot() });
@@ -1112,7 +1216,7 @@ function snapshot() {
     stats: state.stats, winRate: tot ? (state.stats.wins / tot) * 100 : null,
     positions: livePositions(), symbols: symbolsOverview(),
     trades: state.trades.slice(0, 40), log: state.log.slice(0, 50),
-    strat: { sl: STRAT.SL_PCT * 100, trailArm: STRAT.TRAIL_ARM * 100, trailPct: STRAT.TRAIL_PCT * 100, lev: '2-5', universe: state.universe.length },
+    strat: { sl: STRAT.SL_PCT * 100, trailArm: STRAT.TRAIL_ARM * 100, trailPct: STRAT.TRAIL_PCT * 100, lev: '2-5', universe: state.universe.length, relaxOn: STRAT.RELAX_RANGE_ENTRY, weight: WEIGHT.used, weightLimit: WEIGHT.limit },
   };
 }
 
@@ -1149,8 +1253,24 @@ wss.on('connection', (ws) => {
     } else if (cmd.action === 'stop') {
       state.running = false; logLine('⏸️ Bot EN PAUSE'); broadcast({ type: 'status', running: false });
     } else if (cmd.action === 'closeAll') {
-      for (const s of ALL_SYMBOLS) if (state.sym[s].position) await closePos(s, 'MANUEL');
-      logLine('🧹 Fermeture manuelle de toutes les positions');
+      for (const s of Object.keys(state.sym)) if (state.sym[s].position) await closePos(s, 'MANUEL');
+      logLine('🧹 Fermeture manuelle de TOUTES les positions');
+    } else if (cmd.action === 'closeManual') {
+      // Clôture manuelle d'UNE position (totale ou partielle), quel que soit le P&L.
+      const sym = cmd.symbol;
+      const S = sym && state.sym[sym];
+      if (!S || !S.position) { logLine(`⚠️ closeManual: pas de position sur ${sym}`); return; }
+      const pct = cmd.pct != null ? Math.max(1, Math.min(100, parseFloat(cmd.pct))) : 100;
+      const qtyToClose = pct >= 100 ? null : roundQty(sym, S.position.qty * (pct / 100));
+      S.position.closingManual = true; // verrou anti-réconciliation pendant la fermeture
+      logLine(`👤 CLÔTURE MANUELLE ${sym} — ${pct}%`);
+      await closePos(sym, pct >= 100 ? 'MANUEL' : `MANUEL-${pct}%`, qtyToClose);
+      if (state.sym[sym] && state.sym[sym].position) state.sym[sym].position.closingManual = false;
+    } else if (cmd.action === 'toggleRelax') {
+      // Bouton on/off de l'assouplissement d'entrée en RANGE.
+      STRAT.RELAX_RANGE_ENTRY = !STRAT.RELAX_RANGE_ENTRY;
+      logLine(`🔧 Assouplissement RANGE : ${STRAT.RELAX_RANGE_ENTRY ? 'ACTIVÉ' : 'DÉSACTIVÉ'}`);
+      broadcast({ type: 'snapshot', data: snapshot() });
     }
   });
   ws.on('close', () => clients.delete(ws));
@@ -1207,16 +1327,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.7 - trade 1j · multi-régime <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.8 - 1J - MAJ <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.7 trade 1j · multi-régime (range→MR / tendance→suivi) · réconciliation · chrono · scaling out</div>
+  <div class="sub" id="stratline">3.8 - 1J - MAJ · 35 symboles (5 fixes + 30 volatils) · 25 trades · rotation · anti-ban</div>
 
   <div class="controls">
     <button id="start" class="btn-go">▶ Démarrer</button>
     <button id="stop" class="btn-stop">⏸ Pause</button>
     <button id="closeAll" class="btn-kill">⏹ Tout fermer</button>
+    <button id="toggleRelax" class="btn-stop">🔧 Assoupli: —</button>
   </div>
 
   <div class="grid">
@@ -1235,8 +1356,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="sec"><span class="dot"></span>Positions ouvertes</div>
   <div class="table-wrap"><table>
-    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev·Q</th><th>Entrée</th><th>Actuel</th><th>Investi</th><th>SL</th><th>TP</th><th>⏱ Durée</th><th>P&L live</th></tr></thead>
-    <tbody id="positions"><tr><td colspan="10" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr></tbody>
+    <thead><tr><th>Symbole</th><th>Sens</th><th>Lev·Q</th><th>Entrée</th><th>Actuel</th><th>Investi</th><th>SL</th><th>TP</th><th>⏱ Durée</th><th>P&L live</th><th>Action</th></tr></thead>
+    <tbody id="positions"><tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr></tbody>
   </table></div>
 
   <div class="sec"><span class="dot"></span>Surveillance des 20 symboles</div>
@@ -1268,7 +1389,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('mode').textContent=(s.mode||'testnet').toUpperCase();
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
-    $('stratline').textContent='3.7 trade 1j · multi-régime (RANGE→MR / UP→long / DOWN→short) · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · scaling out · x2-5';
+    if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
+    $('stratline').textContent='3.8-1J-MAJ · 35 sym (5 fixes+30 vol) · 25 trades · rotation Q68 · multi-régime (RANGE→MR / UP→long / DOWN→short) · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · scaling out · x2-5';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1285,14 +1407,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function renderPositions(list){
     const tb=$('positions');
-    if(!list||!list.length){tb.innerHTML='<tr><td colspan="10" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
+    if(!list||!list.length){tb.innerHTML='<tr><td colspan="11" class="mut" style="text-align:center;padding:14px">Aucune position</td></tr>';return;}
     tb.innerHTML=list.map(p=>{
       const sc=p.side==='BUY'?'long':'short',st=p.side==='BUY'?'LONG':'SHORT';
       return '<tr><td>'+p.symbol+'</td><td><span class="pill '+sc+'">'+st+'</span></td>'+
         '<td>'+p.lev+'x·Q'+p.quality+'</td><td>'+px(p.entry)+'</td><td>'+px(p.current)+'</td>'+
         '<td>$'+num(p.investi)+'</td><td class="red">'+px(p.sl)+'</td><td class="green">'+px(p.tp)+'</td>'+
         '<td class="'+((p.timeStopMs&&p.ageMs>p.timeStopMs*0.8)?'red':'mut')+'">'+dur(p.ageMs)+(p.adopted?' <span style="color:var(--amber);font-size:9px">adopté</span>':'')+'</td>'+
-        '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td></tr>';
+        '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td>'+
+        '<td style="white-space:nowrap"><input id="pct_'+p.symbol+'" type="number" min="1" max="100" value="100" style="width:44px;background:#0e151d;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:3px 4px;font-size:11px"/>%'+
+        ' <button onclick="closePos(\''+p.symbol+'\')" style="background:rgba(255,84,112,.15);color:var(--red);border:1px solid rgba(255,84,112,.3);border-radius:6px;padding:4px 8px;font-size:11px;font-weight:700;cursor:pointer">Fermer</button></td></tr>';
     }).join('');
   }
 
@@ -1362,6 +1486,13 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }
   };
   ws.onclose=()=>{$('run').textContent='DÉCONNECTÉ';$('run').className='badge off';};
+  window.closePos=function(sym){
+    const inp=document.getElementById('pct_'+sym);
+    const pct=inp?Math.max(1,Math.min(100,Number(inp.value)||100)):100;
+    const msg=pct>=100?('Fermer TOUTE la position '+sym+' ?'):('Fermer '+pct+'% de '+sym+' ?');
+    if(confirm(msg)) ws.send(JSON.stringify({action:'closeManual',symbol:sym,pct:pct}));
+  };
+  $('toggleRelax').onclick=()=>ws.send(JSON.stringify({action:'toggleRelax'}));
   $('start').onclick=()=>ws.send(JSON.stringify({action:'start'}));
   $('stop').onclick=()=>ws.send(JSON.stringify({action:'stop'}));
   $('closeAll').onclick=()=>ws.send(JSON.stringify({action:'closeAll'}));
@@ -1372,7 +1503,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`🚀 Itachi — SERVEUR 3.7 TRADE 1J (multi-régime) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`🚀 Itachi — SERVEUR 3.8-1J-MAJ (35 sym: 5 fixes+30 vol, 25 trades, rotation, multi-régime, clôture manuelle) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
   logLine(`📐 Swing mean-reversion 1h/2h — Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}σ + RSI${STRAT.RSI_PERIOD} (${STRAT.RSI_OVERSOLD}/${STRAT.RSI_OVERBOUGHT}) — régime ADX2h<${STRAT.ADX_RANGE_MAX} — funding souple — SL -${STRAT.SL_PCT*100}% / trailing large armé +${STRAT.TRAIL_ARM*100}% suit -${STRAT.TRAIL_PCT*100}% — levier x2-x5 — mise ${STRAT.STAKE_MIN_USD}-${STRAT.STAKE_MAX_USD}$ — ${STRAT.MAX_POSITIONS_CAP} pos — time-stop 24h — kill -${STRAT.KILL_PCT*100}%`);
   if (!API_KEY || !API_SECRET) logLine('⚠️ Cles API manquantes — lecture seule (pas d ordres).');
   await loadSymbolInfo();
