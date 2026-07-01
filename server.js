@@ -1,19 +1,20 @@
 /* ============================================================
- *  SERVEUR 3.8 - 1J - MAJ  (correctif démarrage + WebSocket robuste)
+ *  SERVEUR 3.8 - 1J - MAJ  (correctif SyntaxError dashboard)
  *  ------------------------------------------------------------
- *  2 correctifs de fiabilité (stratégie inchangée) :
- *   1. Le serveur HTTP démarre EN PREMIER (avant les appels réseau) :
- *      le dashboard s'affiche tout de suite, l'init (klines 28 sym,
- *      scan, flux) se fait en arrière-plan non bloquant (try/catch).
- *   2. WebSocket dashboard avec RECONNEXION AUTOMATIQUE : si Railway
- *      coupe une connexion WS inactive, le client se reconnecte seul
- *      (1.5s). Envois protégés (wsSend) : un clic n'est plus perdu
- *      si la connexion n'est pas prête. -> corrige "le bouton Lancer
- *      ne fait rien / reste en pause".
+ *  CORRECTIF DÉCISIF : une SyntaxError JS (apostrophes mal
+ *  échappées dans le bouton "Fermer", onclick="closePos(''...'')")
+ *  cassait TOUT le script du dashboard -> WebSocket jamais connecté,
+ *  boutons inertes, dashboard figé sur PAUSE. Le bouton utilise
+ *  désormais un data-attribute + délégation d'événement (robuste,
+ *  sans apostrophes imbriquées). JS du dashboard validé entièrement.
+ *
+ *  + serveur HTTP démarre en premier (dashboard immédiat)
+ *  + WebSocket dashboard avec reconnexion auto + envoi protégé
  *
  *  Univers 28 = noyau fixe (BTC/ETH/BNB/SOL/DOGE) + 23 volatils.
  *  25 positions, rotation Q68, clôture manuelle, assoupli togglable,
  *  multi-régime (RANGE/UP/DOWN), réconciliation, chrono, scaling out.
+ *  Stratégie de fond inchangée (base 3.7).
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -1366,7 +1367,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         '<td class="'+((p.timeStopMs&&p.ageMs>p.timeStopMs*0.8)?'red':'mut')+'">'+dur(p.ageMs)+(p.adopted?' <span style="color:var(--amber);font-size:9px">adopté</span>':'')+'</td>'+
         '<td class="'+cls(p.netLive)+'">'+sign(p.netLive)+'$'+num(p.netLive)+' ('+sign(p.pnlPct)+p.pnlPct.toFixed(2)+'%)</td>'+
         '<td style="white-space:nowrap"><input id="pct_'+p.symbol+'" type="number" min="1" max="100" value="100" style="width:42px;background:#0e151d;border:1px solid var(--line);color:var(--txt);border-radius:5px;padding:3px;font-size:11px"/>%'+
-        ' <button onclick="closePos(\''+p.symbol+'\')" style="background:rgba(255,84,112,.15);color:var(--red);border:1px solid rgba(255,84,112,.3);border-radius:6px;padding:4px 8px;font-size:11px;font-weight:700;cursor:pointer">Fermer</button></td></tr>';
+        ' <button data-sym="'+p.symbol+'" class="closeBtn" style="background:rgba(255,84,112,.15);color:var(--red);border:1px solid rgba(255,84,112,.3);border-radius:6px;padding:4px 8px;font-size:11px;font-weight:700;cursor:pointer">Fermer</button></td></tr>';
     }).join('');
   }
 
@@ -1435,11 +1436,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if(m.type==='log'){snap.log.unshift(m.line);if(snap.log.length>50)snap.log.pop();$('log').innerHTML=snap.log.join('<br>');}
     }
   }
-  window.closePos=function(sym){
-    const inp=document.getElementById('pct_'+sym);
-    const pct=inp?Math.max(1,Math.min(100,Number(inp.value)||100)):100;
-    if(confirm(pct>=100?('Fermer TOUTE la position '+sym+' ?'):('Fermer '+pct+'% de '+sym+' ?'))) wsSend({action:'closeManual',symbol:sym,pct:pct});
-  };
+  document.addEventListener('click', function(ev){
+    const btn = ev.target.closest && ev.target.closest('.closeBtn');
+    if(!btn) return;
+    const sym = btn.getAttribute('data-sym');
+    const inp = document.getElementById('pct_'+sym);
+    const pct = inp ? Math.max(1, Math.min(100, Number(inp.value)||100)) : 100;
+    if(confirm(pct>=100 ? ('Fermer TOUTE la position '+sym+' ?') : ('Fermer '+pct+'% de '+sym+' ?'))) wsSend({action:'closeManual', symbol:sym, pct:pct});
+  });
   $('toggleRelax').onclick=()=>wsSend({action:'toggleRelax'});
   $('start').onclick=()=>wsSend({action:'start'});
   $('stop').onclick=()=>wsSend({action:'stop'});
