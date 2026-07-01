@@ -1,28 +1,36 @@
 /* ============================================================
- *  SERVEUR 3.9 - 2h30   (optimise v2 : fuite memoire corrigee)
+ *  SERVEUR 3.10 - SUPPORT PIVOT
  *  ------------------------------------------------------------
- *  Revue de code professionnelle. STRATEGIE 100% INCHANGEE (testee).
+ *  Objectif : garder/augmenter la cadence de trades tout en evitant
+ *  les micro-caps illiquides qui ont cause les pertes (session -94$).
  *
- *  CORRECTIF MEMOIRE : S.klines (100 bougies 1h) et S.klines2h (60
- *  bougies 2h) etaient stockes a chaque cycle mais JAMAIS relus (les
- *  indicateurs utilisent les variables locales). ~4480 objets bougie
- *  inutiles x reecriture/60s -> supprimes. Moins de memoire, moins de
- *  pression sur le ramasse-miettes. Zero impact strategie.
+ *  1. FILTRE LIQUIDITE renforce : volume 24h min 50M -> 150M USDT.
+ *     Ecarte les micro-caps erratiques (HFT, SLP...) ou la mean-reversion
+ *     se fait balayer. Univers ELARGI (23 -> 35 volatils, 40 au total)
+ *     pour compenser et garder du choix.
  *
- *  Note d'ingenierie : le code etait deja tres propre (0 fonction
- *  morte, 0 parametre orphelin, fruit des nettoyages successifs).
- *  Les autres pistes (cache livePositions, micro-parseFloat) ont ete
- *  ECARTEES a dessein : gain marginal, risque > benefice sur un bot
- *  qui fonctionne. On n'optimise pas ce qui n'est pas un goulot demontre.
+ *  2. VOIE SUPPORT/RESISTANCE : achat sur support horizontal, vente sur
+ *     resistance (swing highs/lows sur 50 bougies). Respecte le regime.
  *
- *  Deja optimise (v1) : throttle detection (signal 1x/s vs 28x/s),
- *  broadcast groupe, funding throttle 2.5min, buffer circulaire prix,
- *  VWAP une passe. Bilan : ~30 appels reseau/min, CPU allege.
+ *  3. VOIE POINTS PIVOT : niveaux classiques P/S1/S2/R1/R2 (formule
+ *     standard sur la periode precedente). Achat sur support pivot,
+ *     vente sur resistance pivot. Niveaux objectifs tres suivis.
  *
- *  Strategie (inchangee) : Bollinger + 2e voie VWAP, multi-regime
- *  (RANGE/UP/DOWN), time-stop 2h30/5h30, maker-first, MIN_GAP 30min,
- *  univers 28, 25 pos, rotation Q68, cloture manuelle, assoupli,
- *  reconciliation, chrono, scaling out, SL -2.5%, trailing +1%/-1.5%.
+ *  4. PLANCHER DE CADENCE (B) : au moins 4 trades/heure glissante. Sous
+ *     ce plancher, les trades sont pris en "comblement" -> BRIDES : mise
+ *     reduite 65-85$ + levier faible x2-x3 (limite le risque d'un trade
+ *     force). Garde-fou : qualite min 30 meme en comblement.
+ *     Au-dessus du plancher, si un signal est bon -> trade NORMAL
+ *     (mise 80-280$, levier x2-5). "4 min, plus si les indicateurs sont bons".
+ *
+ *  Conserve tout le 3.9 : Bollinger + VWAP, multi-regime (RANGE/UP/DOWN),
+ *  time-stop 2h30/5h30, maker-first, rotation Q68, cloture manuelle,
+ *  reconciliation, chrono, scaling out, SL -2.5%, trailing +1%/-1.5%,
+ *  + optimisations (throttle detection, broadcast groupe, buffer circulaire).
+ *
+ *  ATTENTION (note d'honnetete) : le plancher force + les micro-caps
+ *  ecartees vont dans le bon sens, mais forcer des trades reste risque
+ *  par nature. Seul un backtest tranchera sur la rentabilite reelle.
  * ============================================================ */
 /**
  * ITACHI MULTI — Bot multi-crypto Binance Futures (testnet)
@@ -164,11 +172,32 @@ const STRAT = {
   MAX_CONSEC_LOSSES: 5,  // coupe-circuit apres 5 pertes consecutives
   COOLDOWN_AFTER_STOP_MS: 3600000, // cooldown 1h sur un symbole apres un stop
 
-  // --- Univers dynamique : cryptos les plus volatiles de Binance ---
+  // --- Univers dynamique : cryptos les plus volatiles ET liquides de Binance ---
   CORE_SYMBOLS: ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'DOGEUSDT'], // noyau TOUJOURS présent
-  DYNAMIC_SIZE: 23,         // nb de volatils dynamiques (hors noyau)
+  DYNAMIC_SIZE: 35,         // univers élargi (compense le filtre liquidité, garde du choix)
   UNIVERSE_REFRESH_MS: 3600000, // re-scan de l'univers toutes les heures
-  UNIVERSE_MIN_VOL_USDT: 50000000, // volume 24h minimum 50M$ (liquidite)
+  UNIVERSE_MIN_VOL_USDT: 150000000, // volume 24h min RENFORCÉ 150M$ (écarte les micro-caps illiquides type HFT/SLP)
+
+  // --- Support / Résistance horizontaux (nouvelle voie d'entrée) ---
+  // Détectés comme les plus hauts/bas récents où le prix a réagi (swing highs/lows).
+  SR_LOOKBACK: 50,          // fenêtre de bougies 1h pour repérer les niveaux
+  SR_TOUCH: 0.004,          // "près" d'un niveau = à moins de 0.4%
+  SR_PIVOT_STRENGTH: 2,     // un swing = plus haut/bas que N bougies de chaque côté
+
+  // --- Points Pivot classiques (nouvelle voie d'entrée) ---
+  // P = (H+L+C)/3 de la période précédente ; S1/R1/S2/R2 dérivés. Niveaux objectifs.
+  PIVOT_TOUCH: 0.004,       // "près" d'un pivot = à moins de 0.4%
+
+  // --- Cadence : PLANCHER de trades par heure (interprétation B) ---
+  MIN_TRADES_PER_HOUR: 4,   // plancher : au moins 4 trades par heure glissante
+  CADENCE_WINDOW_MS: 3600000, // fenêtre glissante d'1h pour compter les trades
+  // Trades de COMBLEMENT (pris pour tenir le plancher quand les signaux sont faibles) :
+  // mise réduite + levier faible pour limiter le risque d'un trade médiocre.
+  FILLER_STAKE_MIN_USD: 65,
+  FILLER_STAKE_MAX_USD: 85,
+  FILLER_LEV_MIN: 2,
+  FILLER_LEV_MAX: 3,
+  FILLER_MIN_QUALITY: 30,   // en dessous, même en comblement on n'entre pas (garde-fou minimal)
 
   // --- Cadence ---
   MIN_GAP_MS: 1800000,  // 30 min minimum entre 2 entrees sur le meme symbole (assoupli 1h->30min)
@@ -210,7 +239,7 @@ function ensureSymbolState(s) {
   state.sym[s] = {
     symbol: s, price: 0, priceBuf: null, priceBufIdx: 0,
     indicators: { rsi: null, bias: 'NEUTRE', quality: null, breakdown: null },
-    swing: { bb: null, rsi: null, atrPct: null, adx: null, volRatio: null, regime: null, funding: null, closedCloses: null, vwap: null },
+    swing: { bb: null, rsi: null, atrPct: null, adx: null, volRatio: null, regime: null, funding: null, closedCloses: null, vwap: null, sr: null, pivot: null },
     position: null, lastEntryAt: 0, busy: false, lastStopAt: 0,
   };
 }
@@ -464,6 +493,43 @@ function rollingVWAP(klines, period) {
   return { vwap, sd: Math.sqrt(variance) };
 }
 
+// SUPPORT / RÉSISTANCE horizontaux : repère les swing highs (résistances) et swing lows
+// (supports) sur la fenêtre. Un swing = un sommet/creux local plus extrême que N bougies
+// de chaque côté. Renvoie les niveaux les plus proches du prix courant (au-dessus/dessous).
+function supportResistance(klines, price) {
+  const n = STRAT.SR_LOOKBACK, k = STRAT.SR_PIVOT_STRENGTH;
+  if (!klines || klines.length < n) return null;
+  const slice = klines.slice(-n);
+  const resistances = [], supports = [];
+  for (let i = k; i < slice.length - k; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = 1; j <= k; j++) {
+      if (slice[i].high <= slice[i - j].high || slice[i].high <= slice[i + j].high) isHigh = false;
+      if (slice[i].low >= slice[i - j].low || slice[i].low >= slice[i + j].low) isLow = false;
+    }
+    if (isHigh) resistances.push(slice[i].high);
+    if (isLow) supports.push(slice[i].low);
+  }
+  // Niveau de support le plus proche SOUS le prix, résistance la plus proche AU-DESSUS
+  const support = supports.filter((s) => s < price).sort((a, b) => b - a)[0] || null;
+  const resistance = resistances.filter((r) => r > price).sort((a, b) => a - b)[0] || null;
+  return { support, resistance };
+}
+
+// POINTS PIVOT classiques : calculés sur la DERNIÈRE bougie de confirmation (période précédente).
+// P = (H+L+C)/3 ; R1 = 2P-L ; S1 = 2P-H ; R2 = P+(H-L) ; S2 = P-(H-L). Niveaux objectifs
+// largement suivis par les traders -> zones de réaction fréquentes.
+function pivotPoints(prevCandle) {
+  if (!prevCandle) return null;
+  const H = prevCandle.high, L = prevCandle.low, C = prevCandle.close;
+  const P = (H + L + C) / 3;
+  return {
+    P,
+    R1: 2 * P - L, S1: 2 * P - H,
+    R2: P + (H - L), S2: P - (H - L),
+  };
+}
+
 // ==================================================================
 // UNIVERS DYNAMIQUE : scan des perpétuels USDT les plus VOLATILS
 // via /fapi/v1/ticker/24hr. Classe par amplitude (high-low)/low sur 24h,
@@ -528,6 +594,7 @@ async function refreshKlines(symbol) {
     S.swing.rsi = rsi(closes, STRAT.RSI_PERIOD);
     S.swing.atrPct = atrPct(kl, STRAT.ATR_PERIOD);
     S.swing.volRatio = volumeRatio(kl, STRAT.ATR_PERIOD);
+    S.swing.sr = supportResistance(kl, kl[kl.length - 1].close); // support/résistance horizontaux
     S.swing.vwap = rollingVWAP(kl, STRAT.VWAP_PERIOD); // VWAP glissant (valeur juste pondérée volume)
     S.indicators.rsi = S.swing.rsi;
 
@@ -536,6 +603,8 @@ async function refreshKlines(symbol) {
       symbol, interval: STRAT.TF_CONFIRM, limit: STRAT.CONFIRM_LIMIT,
     });
     const kl2 = raw2h.map((c) => ({ time: c[0], high: +c[2], low: +c[3], close: +c[4], vol: +c[5] }));
+    // Points pivot : sur la dernière bougie 2h FERMÉE (avant-dernière du tableau).
+    S.swing.pivot = pivotPoints(kl2.length >= 2 ? kl2[kl2.length - 2] : null);
     const adxObj = adx(kl2, STRAT.ADX_PERIOD);
     S.swing.adx = adxObj ? adxObj.adx : null;
     S.swing.adxDir = adxObj ? adxObj.dir : 0; // +1 haussier, -1 baissier
@@ -643,6 +712,27 @@ function computeSignal(symbol) {
       else if (dev >= STRAT.VWAP_DEV_BAND && sw.rsi >= 50) { side = 'SELL'; via = 'VWAP'; }
     }
   }
+
+  // ============= 3e VOIE : SUPPORT / RÉSISTANCE horizontaux =============
+  // Rebond sur support (achat) ou rejet sous résistance (vente) — niveaux où le prix a
+  // historiquement réagi. Cohérent multi-régime : on ne contrarie pas la tendance.
+  if (!side && sw.sr) {
+    const { support, resistance } = sw.sr;
+    const nearSup = support && Math.abs(px - support) / px <= STRAT.SR_TOUCH;
+    const nearRes = resistance && Math.abs(px - resistance) / px <= STRAT.SR_TOUCH;
+    if (sw.regime !== 'DOWN' && nearSup && sw.rsi <= 55) { side = 'BUY'; via = 'S/R'; }       // achat sur support (sauf tendance baissière)
+    else if (sw.regime !== 'UP' && nearRes && sw.rsi >= 45) { side = 'SELL'; via = 'S/R'; }   // vente sur résistance (sauf tendance haussière)
+  }
+
+  // ============= 4e VOIE : POINTS PIVOT classiques =============
+  // Rebond sur un support pivot (S1/S2) -> LONG ; rejet sur une résistance pivot (R1/R2) -> SHORT.
+  // Niveaux objectifs très suivis -> zones de réaction fréquentes.
+  if (!side && sw.pivot) {
+    const pv = sw.pivot;
+    const near = (lvl) => lvl && Math.abs(px - lvl) / px <= STRAT.PIVOT_TOUCH;
+    if (sw.regime !== 'DOWN' && (near(pv.S1) || near(pv.S2)) && sw.rsi <= 55) { side = 'BUY'; via = 'PIVOT'; }
+    else if (sw.regime !== 'UP' && (near(pv.R1) || near(pv.R2)) && sw.rsi >= 45) { side = 'SELL'; via = 'PIVOT'; }
+  }
   if (!side) { S.indicators.quality = null; return null; }
 
   // --- Score de qualité (0-100) ---
@@ -698,14 +788,24 @@ function levForQuality(quality) {
   return STRAT.LEV_BY_Q[STRAT.LEV_BY_Q.length - 1].lev;
 }
 
-// Compte les mises exceptionnelles 9% actuellement ouvertes.
+// Compte les trades OUVERTS dans la dernière heure glissante (pour le plancher de cadence).
+function tradesLastHour() {
+  if (!state.openTimestamps) return 0;
+  const cutoff = Date.now() - STRAT.CADENCE_WINDOW_MS;
+  return state.openTimestamps.filter((t) => t >= cutoff).length;
+}
 
-// Décide mise + levier. Renvoie aussi le flag "exceptional" pour l'affichage.
-// Les obligatoires (Q, MTF, expo) sont déjà vérifiés en amont (tryOpen).
-function sizing(signal) {
-  // Mise interpolée entre STAKE_MIN et STAKE_MAX selon la qualité (Q>=Q_FOR_MAX -> max).
+// Décide mise + levier. Un trade de COMBLEMENT (filler=true) est bridé : mise réduite
+// 65-85$ et levier faible x2-x3, pour limiter le risque quand on force le plancher horaire.
+function sizing(signal, filler) {
   const q = Math.max(0, Math.min(STRAT.Q_FOR_MAX_STAKE, signal.quality));
   const frac = q / STRAT.Q_FOR_MAX_STAKE;
+  if (filler) {
+    // Trade de comblement : petite mise, petit levier (proportionnels à la qualité résiduelle).
+    const stake = STRAT.FILLER_STAKE_MIN_USD + frac * (STRAT.FILLER_STAKE_MAX_USD - STRAT.FILLER_STAKE_MIN_USD);
+    const lev = frac >= 0.5 ? STRAT.FILLER_LEV_MAX : STRAT.FILLER_LEV_MIN;
+    return { stake: Math.round(stake), lev };
+  }
   const stake = STRAT.STAKE_MIN_USD + frac * (STRAT.STAKE_MAX_USD - STRAT.STAKE_MIN_USD);
   const lev = levForQuality(signal.quality);
   return { stake: Math.round(stake), lev };
@@ -854,7 +954,14 @@ async function tryOpen(symbol, signal) {
   // Cooldown après un stop sur ce symbole
   if (S.lastStopAt && now - S.lastStopAt < STRAT.COOLDOWN_AFTER_STOP_MS) return;
 
-  const { stake, lev } = sizing(signal);
+  // PLANCHER DE CADENCE (B) : si on a déjà atteint 4 trades sur l'heure glissante, un signal
+  // faible (qualité sous le seuil de comblement) n'est PAS un filler -> mais s'il est vraiment
+  // faible on garde le garde-fou. Un trade pris SOUS le plancher est "filler" -> mise/levier bridés.
+  const underFloor = tradesLastHour() < STRAT.MIN_TRADES_PER_HOUR;
+  const filler = underFloor; // sous le plancher -> trade de comblement bridé
+  if (filler && signal.quality < STRAT.FILLER_MIN_QUALITY) return; // garde-fou minimal même en comblement
+
+  const { stake, lev } = sizing(signal, filler);
   if (openPositionsCount() >= STRAT.MAX_POSITIONS_CAP) {
     if (STRAT.ROTATION_ENABLED && signal.quality >= STRAT.ROTATION_MIN_Q) {
       const victim = findRotationCandidate(symbol);
@@ -904,8 +1011,14 @@ async function tryOpen(symbol, signal) {
     openedAt: now, peakPnl: 0, scaleDone: [],
   };
   S.lastEntryAt = now;
+  // Horodatage d'ouverture pour le plancher de cadence (heure glissante).
+  if (!state.openTimestamps) state.openTimestamps = [];
+  state.openTimestamps.push(now);
+  const cut = now - STRAT.CADENCE_WINDOW_MS;
+  state.openTimestamps = state.openTimestamps.filter((t) => t >= cut);
   const f = S.swing.funding != null ? ` funding=${(S.swing.funding*100).toFixed(3)}%` : '';
-  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} x${lev} Q=${signal.quality} via=${signal.via || 'BB'} SL-${(exits.slPct*100).toFixed(1)}%${f} [${entryFill}]`);
+  const fillerTag = filler ? ' [comblement]' : '';
+  logLine(`🟢 ${symbol} ${signal.side} qty=${qty} @ ${entry.toFixed(4)} x${lev} Q=${signal.quality} via=${signal.via || 'BB'} SL-${(exits.slPct*100).toFixed(1)}%${f} [${entryFill}]${fillerTag}`);
   broadcast({ type: 'positions', positions: livePositions() });
 }
 
@@ -1388,11 +1501,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
   <div class="head">
     <span class="logo">CryptoSignal<span class="c">AI</span> · Multi</span>
-    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.9 - 2h30 · 28 sym <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
+    <span class="badge" style="background:rgba(0,245,200,.12);color:#00F5C8;border:1px solid rgba(0,245,200,.3)">3.10 - Support Pivot · 40 sym <span style="opacity:.6;font-weight:600">· WR ~?%</span></span>
     <span id="mode" class="badge net">TESTNET</span>
     <span id="run" class="badge off">PAUSE</span>
   </div>
-  <div class="sub" id="stratline">3.9-2h30 · 28 sym · Bollinger+VWAP · time-stop 2h30/5h30 · maker-first · multi-régime</div>
+  <div class="sub" id="stratline">3.10-SupportPivot · 40 sym · BB+VWAP+S/R+Pivot · liquidité 150M · plancher 4/h · multi-régime</div>
 
   <div class="controls">
     <button id="start" class="btn-go">▶ Démarrer</button>
@@ -1468,7 +1581,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     $('run').textContent=s.killed?'KILL -45%':(s.running?'EN MARCHE':'PAUSE');
     $('run').className='badge '+(s.running?'on':'off');
     if($('toggleRelax'))$('toggleRelax').textContent='🔧 Assoupli: '+(s.strat&&s.strat.relaxOn?'ON':'OFF');
-    $('stratline').textContent='3.9-2h30 · 28 sym · Bollinger+VWAP · TS 2h30/5h30 · maker-first · rotation Q68 · multi-régime (RANGE→MR / UP→long / DOWN→short) · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · scaling out · x2-5';
+    $('stratline').textContent='3.10-SupportPivot · 40 sym · BB+VWAP+S/R+Pivot · liquidité 150M · plancher 4/h · rotation Q68 · multi-régime (RANGE→MR / UP→long / DOWN→short) · SL -'+(s.strat?s.strat.sl:2.5)+'% · trailing +'+(s.strat?s.strat.trailArm:1)+'%/-'+(s.strat?s.strat.trailPct:1.5)+'% · scaling out · x2-5';
     $('cap').textContent='$'+num(s.capital);
     $('net').textContent=sign(s.stats.net)+'$'+num(s.stats.net); $('net').className='v '+cls(s.stats.net);
     $('wr').textContent=s.winRate!=null?Math.round(s.winRate)+'%':'—';
@@ -1584,7 +1697,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 // DÉMARRAGE
 // ==================================================================
 async function start() {
-  logLine(`\u{1F680} Itachi — SERVEUR 3.9-2h30 (28 sym, Bollinger+VWAP, TS 2h30/5h30, maker-first) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
+  logLine(`\u{1F680} Itachi — SERVEUR 3.10-SupportPivot (40 sym, BB+VWAP+S/R+Pivot, liquidité 150M, plancher 4/h) — ${MODE.toUpperCase()} — capital $${CAPITAL_START}`);
   logLine(`\u{1F4D0} Swing mean-reversion 1h/2h — Bollinger ${STRAT.BB_PERIOD}/${STRAT.BB_STDDEV}\u03C3 + RSI${STRAT.RSI_PERIOD} (${STRAT.RSI_OVERSOLD}/${STRAT.RSI_OVERBOUGHT}) — SL -${STRAT.SL_PCT*100}% / trailing +${STRAT.TRAIL_ARM*100}%/-${STRAT.TRAIL_PCT*100}% — x2-5 — mise ${STRAT.STAKE_MIN_USD}-${STRAT.STAKE_MAX_USD}$ — ${STRAT.MAX_POSITIONS_CAP} pos — kill -${STRAT.KILL_PCT*100}%`);
   if (!API_KEY || !API_SECRET) logLine('\u26A0\uFE0F Cles API manquantes — lecture seule (pas d ordres).');
 
